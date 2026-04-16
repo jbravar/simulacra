@@ -45,6 +45,7 @@
 //! ```
 
 pub mod net;
+pub mod parallel;
 mod queue;
 mod rng;
 pub mod scenario;
