@@ -15,6 +15,67 @@ pub use node::{MessageId, NodeId};
 pub use topology::{Link, Route, Topology, TopologyBuilder};
 pub use traced::{NetTraceDropReason, NetTraceEvent, TracedNetwork};
 
+/// Per-link drop policy applied at admission time when the link is
+/// congested.
+///
+/// Default is [`DropPolicy::TailDrop`], which only sheds load once the
+/// buffer is exhausted (identical to the classic `buffer_bytes` behavior).
+/// [`DropPolicy::RandomEarlyDetection`] models active queue management by
+/// probabilistically dropping incoming messages once queue occupancy
+/// crosses a configurable threshold, before the hard buffer limit is hit.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum DropPolicy {
+    /// Admit while the pending byte count fits under the link's buffer.
+    /// This is the classic FIFO / tail-drop behavior.
+    #[default]
+    TailDrop,
+    /// Random Early Detection (RED).
+    ///
+    /// * Below `min_bytes` of pending work: never drop (still subject to
+    ///   the hard buffer cap).
+    /// * In `[min_bytes, max_bytes)`: drop with probability linearly
+    ///   interpolated from `0.0` at `min_bytes` up to `max_prob` at
+    ///   `max_bytes`.
+    /// * At or above `max_bytes`: always drop.
+    ///
+    /// `max_prob` is in `(0.0, 1.0]`. The hard `buffer_bytes` cap still
+    /// applies; RED just introduces earlier drops.
+    RandomEarlyDetection {
+        /// Pending bytes below which RED never drops.
+        min_bytes: u64,
+        /// Pending bytes at or above which RED always drops.
+        max_bytes: u64,
+        /// Drop probability at `max_bytes`.
+        max_prob: f64,
+    },
+}
+
+impl DropPolicy {
+    /// Constructs a validated `RandomEarlyDetection` policy.
+    ///
+    /// Panics on clearly-wrong inputs to fail fast at topology build time
+    /// rather than silently admitting every message.
+    pub fn red(min_bytes: u64, max_bytes: u64, buffer_bytes: u64, max_prob: f64) -> Self {
+        assert!(
+            min_bytes <= max_bytes,
+            "DropPolicy::red: min_bytes ({min_bytes}) must be <= max_bytes ({max_bytes})"
+        );
+        assert!(
+            max_bytes <= buffer_bytes,
+            "DropPolicy::red: max_bytes ({max_bytes}) must be <= buffer_bytes ({buffer_bytes})"
+        );
+        assert!(
+            max_prob > 0.0 && max_prob <= 1.0,
+            "DropPolicy::red: max_prob ({max_prob}) must be in (0.0, 1.0]"
+        );
+        DropPolicy::RandomEarlyDetection {
+            min_bytes,
+            max_bytes,
+            max_prob,
+        }
+    }
+}
+
 use crate::rng::SimRng;
 use crate::sim::Simulation;
 use crate::time::{Duration, Time};
@@ -178,13 +239,40 @@ enum PerLinkOutcome {
     Overflow,
 }
 
+/// Evaluates a per-link `DropPolicy` against the currently pending queue
+/// depth. Returns `true` if the policy says the incoming message should
+/// be dropped *before* consulting the hard buffer cap. The hard cap is
+/// always enforced separately by the caller.
+fn policy_wants_drop(policy: DropPolicy, pending: u64, rng: &mut SimRng) -> bool {
+    match policy {
+        DropPolicy::TailDrop => false,
+        DropPolicy::RandomEarlyDetection {
+            min_bytes,
+            max_bytes,
+            max_prob,
+        } => {
+            if pending >= max_bytes {
+                true
+            } else if pending < min_bytes || max_bytes == min_bytes {
+                false
+            } else {
+                // Linear ramp from 0.0 at min_bytes to max_prob at max_bytes.
+                let span = (max_bytes - min_bytes) as f64;
+                let over = (pending - min_bytes) as f64;
+                let prob = max_prob * (over / span);
+                rng.bool(prob)
+            }
+        }
+    }
+}
+
 /// Walks the shortest path from `src` to `dst` hop-by-hop, applying per-link
 /// bandwidth serialization for a message of `size_bytes` bytes.
 ///
 /// Returns an `Admitted` delay representing only the *extra* delay induced
 /// by bandwidth (link latencies themselves are assumed accounted for by
 /// the caller), or `Overflow` if any hop's `buffer_bytes` capacity would
-/// be exceeded by admission.
+/// be exceeded by admission or its [`DropPolicy`] chooses to drop.
 ///
 /// `link_busy` is only mutated when the outcome is `Admitted`: the walk
 /// collects per-hop admission decisions into a local scratch buffer and
@@ -197,6 +285,7 @@ enum PerLinkOutcome {
 fn walk_per_link_bandwidth(
     topology: &mut Topology,
     link_busy: &mut std::collections::HashMap<(NodeId, NodeId), Time>,
+    rng: &mut SimRng,
     src: NodeId,
     dst: NodeId,
     size_bytes: u64,
@@ -219,6 +308,7 @@ fn walk_per_link_bandwidth(
         let link_latency = link.map(|l| l.latency).unwrap_or(Duration::ZERO);
         let link_bandwidth = link.and_then(|l| l.bandwidth);
         let link_buffer = link.and_then(|l| l.buffer_bytes);
+        let link_policy = link.map(|l| l.drop_policy).unwrap_or_default();
 
         if let Some(bps) = link_bandwidth {
             let busy = link_busy
@@ -226,11 +316,17 @@ fn walk_per_link_bandwidth(
                 .copied()
                 .unwrap_or(Time::ZERO);
 
-            // Admission check against the per-link buffer, if configured.
-            // We evaluate queue depth as of `hop_time` — the time the
-            // message's first byte is ready to enter this hop.
+            // Admission check against the per-link buffer + drop policy.
+            // Evaluated as of `hop_time` — the time the message's first
+            // byte is ready to enter this hop.
             if let Some(buf) = link_buffer {
                 let pending = pending_bytes_at(bps, busy, hop_time);
+                // Policy-driven early drop (AQM) is only meaningful when
+                // the link has a buffer configured; a policy without a
+                // buffer has no queue depth to reason about.
+                if policy_wants_drop(link_policy, pending, rng) {
+                    return PerLinkOutcome::Overflow;
+                }
                 if pending.saturating_add(size_bytes) > buf {
                     return PerLinkOutcome::Overflow;
                 }
@@ -529,6 +625,7 @@ impl<P, L: LatencyModel> Network<P, L> {
         walk_per_link_bandwidth(
             &mut self.topology,
             &mut self.link_busy,
+            &mut self.rng,
             src,
             dst,
             size_bytes,
@@ -659,6 +756,7 @@ impl<P, L: LatencyModel> Network<P, L> {
                     match walk_per_link_bandwidth(
                         &mut ctx.topology,
                         &mut ctx.link_busy,
+                        &mut ctx.rng,
                         src,
                         dst,
                         size_bytes,
@@ -1261,6 +1359,150 @@ mod tests {
         assert_eq!(delivered.len(), 2);
         assert_eq!(dropped.len(), 1);
         assert_eq!(dropped[0].1, DropReason::BufferOverflow);
+    }
+
+    #[test]
+    fn red_never_drops_below_min_threshold() {
+        // RED thresholds live well above where our queue occupancy stays.
+        // Three 1 MB messages produce pending values {0, 1M, 2M}, all
+        // strictly below min=5M, so all three must be admitted.
+        let topo = TopologyBuilder::new(2)
+            .link_with_policy(
+                0u32,
+                1u32,
+                Duration::from_millis(0),
+                1_000_000,
+                10_000_000,
+                DropPolicy::red(5_000_000, 8_000_000, 10_000_000, 1.0),
+            )
+            .build();
+
+        let mut net: Network<u32> = Network::new(topo, 42);
+        for i in 0..3 {
+            net.send_sized(NodeId(0), NodeId(1), i, 1_000_000);
+        }
+        let stats = net.run(|_ctx, _event| {});
+        assert_eq!(stats.messages_delivered, 3);
+        assert_eq!(stats.messages_dropped, 0);
+    }
+
+    #[test]
+    fn red_hard_drops_above_max_threshold() {
+        // RED: buffer=10M, min=2M, max=3M, max_prob=1.0.
+        // Burst of five concurrent 1 MB sends at t=0 produces pending
+        // values {0, 1M, 2M, 3M, 3M}. Admissions happen in
+        // sequence, so the first three admit (below max) and the fourth
+        // / fifth sit at >= max and must drop unconditionally.
+        //
+        // Note pending=2M is AT min: ramp probability is 0 (numerator
+        // zero), which is a deterministic admit with no RNG draw.
+        let topo = TopologyBuilder::new(2)
+            .link_with_policy(
+                0u32,
+                1u32,
+                Duration::from_millis(0),
+                1_000_000,
+                10_000_000,
+                DropPolicy::red(2_000_000, 3_000_000, 10_000_000, 1.0),
+            )
+            .build();
+
+        let mut net: Network<u32> = Network::new(topo, 42);
+        for i in 0..5 {
+            net.send_sized(NodeId(0), NodeId(1), i, 1_000_000);
+        }
+        let mut delivered = Vec::new();
+        let mut dropped = Vec::new();
+        let stats = net.run(|_ctx, event| match event {
+            NetEvent::Deliver(msg) => delivered.push(msg.payload),
+            NetEvent::Drop { message, reason } => dropped.push((message.payload, reason)),
+        });
+        assert_eq!(stats.messages_delivered, 3);
+        assert_eq!(stats.messages_dropped, 2);
+        assert_eq!(delivered, vec![0, 1, 2]);
+        assert!(
+            dropped
+                .iter()
+                .all(|(_, r)| *r == DropReason::BufferOverflow)
+        );
+    }
+
+    #[test]
+    fn red_ramp_drops_are_deterministic_and_nontrivial() {
+        // A steep RED ramp across the whole buffer: min=0, max=5M,
+        // prob=1.0. A 20-message burst will certainly produce *some*
+        // early RED drops (ramp fires as soon as pending > 0), *some*
+        // hard drops (once pending reaches 5M = max), and *some*
+        // deliveries. With a fixed seed, the outcome must be exactly
+        // reproducible across runs.
+        fn run() -> (u64, u64) {
+            let topo = TopologyBuilder::new(2)
+                .link_with_policy(
+                    0u32,
+                    1u32,
+                    Duration::from_millis(0),
+                    1_000_000,
+                    10_000_000,
+                    DropPolicy::red(0, 5_000_000, 10_000_000, 1.0),
+                )
+                .build();
+
+            let mut net: Network<u32> = Network::new(topo, 0xC0FFEE);
+            for i in 0..20 {
+                net.send_sized(NodeId(0), NodeId(1), i, 1_000_000);
+            }
+            let stats = net.run(|_ctx, _event| {});
+            (stats.messages_delivered, stats.messages_dropped)
+        }
+
+        let (d1, x1) = run();
+        let (d2, x2) = run();
+        assert_eq!((d1, x1), (d2, x2), "RED admission must be deterministic");
+        assert_eq!(d1 + x1, 20);
+        assert!(d1 > 0, "expected some deliveries, got {d1}");
+        assert!(x1 > 0, "expected some RED drops, got {x1}");
+    }
+
+    #[test]
+    fn red_drops_more_than_tail_under_sustained_load() {
+        // Same traffic, same link parameters — only the policy differs.
+        // RED should shed more than tail drop under sustained congestion
+        // because it starts dropping before the buffer is full.
+        fn run_with_policy(red: bool) -> u64 {
+            let topo = if red {
+                TopologyBuilder::new(2).link_with_policy(
+                    0u32,
+                    1u32,
+                    Duration::from_millis(0),
+                    1_000_000,
+                    10_000_000,
+                    DropPolicy::red(2_000_000, 8_000_000, 10_000_000, 1.0),
+                )
+            } else {
+                TopologyBuilder::new(2).link_with_capacity_and_buffer(
+                    0u32,
+                    1u32,
+                    Duration::from_millis(0),
+                    1_000_000,
+                    10_000_000,
+                )
+            }
+            .build();
+
+            let mut net: Network<u32> = Network::new(topo, 7);
+            for i in 0..30 {
+                net.send_sized(NodeId(0), NodeId(1), i, 1_000_000);
+            }
+            let stats = net.run(|_ctx, _event| {});
+            stats.messages_dropped
+        }
+
+        let red_drops = run_with_policy(true);
+        let tail_drops = run_with_policy(false);
+        assert!(
+            red_drops > tail_drops,
+            "expected RED ({red_drops}) to drop strictly more than TailDrop ({tail_drops})"
+        );
     }
 
     #[test]

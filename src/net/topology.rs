@@ -7,6 +7,7 @@ use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
 use super::node::NodeId;
+use crate::net::DropPolicy;
 use crate::time::Duration;
 
 /// A link between two nodes with associated latency and optional bandwidth.
@@ -28,6 +29,13 @@ pub struct Link {
     /// `DropReason::BufferOverflow`. `None` means an unbounded queue (the
     /// default for backwards compatibility).
     pub buffer_bytes: Option<u64>,
+    /// Drop policy that governs admission when the link is congested.
+    ///
+    /// Defaults to [`DropPolicy::TailDrop`], which only drops once the
+    /// buffer is actually full (current behavior). Other variants (e.g.
+    /// [`DropPolicy::RandomEarlyDetection`]) can shed load probabilistically
+    /// ahead of buffer exhaustion.
+    pub drop_policy: DropPolicy,
 }
 
 /// Dijkstra priority-queue entry. Defined at module level so that scratch
@@ -144,7 +152,7 @@ impl Topology {
 
     /// Adds a directed link with an optional bandwidth cap and an optional
     /// per-link buffer in bytes. A buffer only has an effect when
-    /// `bandwidth` is also set.
+    /// `bandwidth` is also set. Uses [`DropPolicy::TailDrop`] by default.
     pub fn add_link_full(
         &mut self,
         src: NodeId,
@@ -153,6 +161,28 @@ impl Topology {
         bandwidth: Option<u64>,
         buffer_bytes: Option<u64>,
     ) {
+        self.add_link_full_with_policy(
+            src,
+            dst,
+            latency,
+            bandwidth,
+            buffer_bytes,
+            DropPolicy::TailDrop,
+        );
+    }
+
+    /// Adds a directed link with an explicit drop policy. Like
+    /// [`Topology::add_link_full`] but lets callers plug in AQM variants
+    /// such as [`DropPolicy::RandomEarlyDetection`].
+    pub fn add_link_full_with_policy(
+        &mut self,
+        src: NodeId,
+        dst: NodeId,
+        latency: Duration,
+        bandwidth: Option<u64>,
+        buffer_bytes: Option<u64>,
+        drop_policy: DropPolicy,
+    ) {
         self.clear_route_cache();
         if src.as_usize() < self.node_count && dst.as_usize() < self.node_count {
             self.adjacency[src.as_usize()].push(Link {
@@ -160,6 +190,7 @@ impl Topology {
                 latency,
                 bandwidth,
                 buffer_bytes,
+                drop_policy,
             });
         }
     }
@@ -436,6 +467,63 @@ impl TopologyBuilder {
             latency,
             Some(bandwidth_bps),
             Some(buffer_bytes),
+        );
+        self
+    }
+
+    /// Adds a bidirectional link with a bandwidth cap, a per-link buffer,
+    /// and an explicit [`DropPolicy`].
+    ///
+    /// Use [`DropPolicy::red`] to construct a validated RED configuration,
+    /// or [`DropPolicy::TailDrop`] for the default FIFO behavior
+    /// (equivalent to [`TopologyBuilder::link_with_capacity_and_buffer`]).
+    pub fn link_with_policy(
+        mut self,
+        a: impl Into<NodeId>,
+        b: impl Into<NodeId>,
+        latency: Duration,
+        bandwidth_bps: u64,
+        buffer_bytes: u64,
+        policy: DropPolicy,
+    ) -> Self {
+        let a = a.into();
+        let b = b.into();
+        self.topology.add_link_full_with_policy(
+            a,
+            b,
+            latency,
+            Some(bandwidth_bps),
+            Some(buffer_bytes),
+            policy,
+        );
+        self.topology.add_link_full_with_policy(
+            b,
+            a,
+            latency,
+            Some(bandwidth_bps),
+            Some(buffer_bytes),
+            policy,
+        );
+        self
+    }
+
+    /// Directed version of [`TopologyBuilder::link_with_policy`].
+    pub fn directed_link_with_policy(
+        mut self,
+        src: impl Into<NodeId>,
+        dst: impl Into<NodeId>,
+        latency: Duration,
+        bandwidth_bps: u64,
+        buffer_bytes: u64,
+        policy: DropPolicy,
+    ) -> Self {
+        self.topology.add_link_full_with_policy(
+            src.into(),
+            dst.into(),
+            latency,
+            Some(bandwidth_bps),
+            Some(buffer_bytes),
+            policy,
         );
         self
     }

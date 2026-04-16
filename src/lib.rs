@@ -63,7 +63,7 @@ pub use trace::{ReplayError, Trace, TraceEvent, TraceMismatch, TraceRecorder};
 
 // Re-export commonly used network types at crate root for convenience
 pub use net::{
-    DropReason, FixedLatency, LatencyModel, Message, MessageId, NetConfig, NetEvent,
+    DropPolicy, DropReason, FixedLatency, LatencyModel, Message, MessageId, NetConfig, NetEvent,
     NetTraceDropReason, NetTraceEvent, Network, NetworkStats, NodeId, OverheadPlusJitter,
     PercentageJitter, Route, RunContext, SpikyLatency, Topology, TopologyBuilder, TracedNetwork,
     UniformJitter,
