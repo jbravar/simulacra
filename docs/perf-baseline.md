@@ -18,6 +18,12 @@ regressions) has something concrete to compare against.
   (`Option<Vec<Option<Route>>>`). `clear_route_cache` is O(1) and
   construction + `add_link` no longer have to zero N² slots. Fixes what was
   effectively O(N³) star-topology construction.
+- **v0.1.0 + buffer-overflow** — after adding per-link `buffer_bytes`
+  admission control with atomic all-or-nothing commit across hops.
+  Network hot path is unchanged for unsized / unbuffered sends and adds a
+  single `Option<u64>` check per hop when buffers are configured; no
+  measurable bench delta is expected on the existing workloads (none of
+  which use buffers).
 
 ## Machine
 
@@ -91,9 +97,12 @@ remain comfortably ahead of the original baseline.
 - `TaskSim` saw the biggest Phase 6 wins (up to -48%) thanks to the
   ready-buffer reuse and topology scratch amortization. The gap between
   `Network` and `TaskSim` at equal scale has closed considerably.
-- Next likely hotspot: `NetEvent<P>` clones inside the event queue for
-  non-`Copy` payload types. Worth revisiting if Phase 7 workloads become
-  payload-heavy.
+- Payload-clone hotspot check: the send path moves `P` by value through
+  `Message::new` → `NetEvent::{Deliver,Drop}` → `EventQueue::schedule`
+  (→ `BinaryHeap::push`) → `pop`. A `rg "\.clone\(\)" src/` sweep finds
+  only two call sites in the crate, neither on the net hot path
+  (`TraceRecorder::record_clone` is opt-in; the other is a unit test).
+  No mitigation needed for non-`Copy` payloads at the current layer.
 - For very small-N workloads, the `Vec<Option<Route>>` cache's eager
   allocation is measurable. Lazy init is a cheap follow-up if we care.
 
