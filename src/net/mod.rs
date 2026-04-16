@@ -65,6 +65,11 @@ pub enum DropReason {
     PacketLoss,
     /// The source and destination are separated by an active network partition.
     Partitioned,
+    /// A per-link buffer on the message's path was full at admission time.
+    ///
+    /// Only produced by sized sends (`send_sized`/`send_at_sized`) that
+    /// traverse at least one link configured with `buffer_bytes`.
+    BufferOverflow,
 }
 
 /// Configuration for a network simulation.
@@ -148,14 +153,43 @@ fn partition_key(a: NodeId, b: NodeId) -> (NodeId, NodeId) {
     }
 }
 
+/// Returns an approximation of the bytes still queued on a link at time
+/// `now`, given that the link is known to be busy until `busy_until` at
+/// `bps` bytes/sec. Uses u128 intermediate math to avoid overflow and
+/// floors the result — a small one-byte undercount is acceptable for
+/// admission control (it matches the intuition that exactly-drained means
+/// zero queue).
+fn pending_bytes_at(bps: u64, busy_until: Time, now: Time) -> u64 {
+    if bps == 0 || busy_until <= now {
+        return 0;
+    }
+    let remaining_ns = busy_until.as_nanos().saturating_sub(now.as_nanos());
+    let bytes = (remaining_ns as u128 * bps as u128) / 1_000_000_000u128;
+    u64::try_from(bytes).unwrap_or(u64::MAX)
+}
+
+/// Outcome of walking the shortest path for per-link bandwidth admission.
+#[derive(Debug, Clone, Copy)]
+enum PerLinkOutcome {
+    /// Admitted along the entire path; extra delay added by per-link tx +
+    /// queueing beyond what the latency model already accounts for.
+    Admitted(Duration),
+    /// Admission blocked because the buffer on some hop was full.
+    Overflow,
+}
+
 /// Walks the shortest path from `src` to `dst` hop-by-hop, applying per-link
 /// bandwidth serialization for a message of `size_bytes` bytes.
 ///
-/// Mutates `link_busy` for every link with a configured bandwidth cap.
-/// Returns only the *extra* delay induced by bandwidth; the link latencies
-/// themselves are assumed to already be accounted for by the caller (via
-/// `latency_model.compute(route.total_latency)`). This keeps the latency
-/// model's jitter behavior consistent between sized and unsized sends.
+/// Returns an `Admitted` delay representing only the *extra* delay induced
+/// by bandwidth (link latencies themselves are assumed accounted for by
+/// the caller), or `Overflow` if any hop's `buffer_bytes` capacity would
+/// be exceeded by admission.
+///
+/// `link_busy` is only mutated when the outcome is `Admitted`: the walk
+/// collects per-hop admission decisions into a local scratch buffer and
+/// commits them only if every hop passes admission, so an overflowing
+/// message never "burns" capacity on earlier hops along its path.
 ///
 /// `arrival_at_src_now` is the time at which the message's first byte is
 /// ready to enter the network at `src` (i.e., after any pair-level
@@ -167,30 +201,45 @@ fn walk_per_link_bandwidth(
     dst: NodeId,
     size_bytes: u64,
     arrival_at_src_now: Time,
-) -> Duration {
+) -> PerLinkOutcome {
     let mut current = src;
     let mut hop_time = arrival_at_src_now;
     let mut accumulated_link_latency = Duration::ZERO;
+    // Collected but-not-yet-committed `link_busy` updates. Expected to be
+    // tiny (bounded by the path length), so inline allocation here is fine.
+    let mut admissions: Vec<((NodeId, NodeId), Time)> = Vec::new();
 
     while current != dst {
         let next = match topology.route(current, dst) {
             Some(r) if r.hop_count > 0 => r.next_hop,
-            _ => return Duration::ZERO,
+            _ => return PerLinkOutcome::Admitted(Duration::ZERO),
         };
 
-        let link = topology.link_between(current, next);
+        let link = topology.link_between(current, next).copied();
         let link_latency = link.map(|l| l.latency).unwrap_or(Duration::ZERO);
         let link_bandwidth = link.and_then(|l| l.bandwidth);
+        let link_buffer = link.and_then(|l| l.buffer_bytes);
 
         if let Some(bps) = link_bandwidth {
-            let tx = transmission_duration(bps, size_bytes);
             let busy = link_busy
                 .get(&(current, next))
                 .copied()
                 .unwrap_or(Time::ZERO);
+
+            // Admission check against the per-link buffer, if configured.
+            // We evaluate queue depth as of `hop_time` — the time the
+            // message's first byte is ready to enter this hop.
+            if let Some(buf) = link_buffer {
+                let pending = pending_bytes_at(bps, busy, hop_time);
+                if pending.saturating_add(size_bytes) > buf {
+                    return PerLinkOutcome::Overflow;
+                }
+            }
+
+            let tx = transmission_duration(bps, size_bytes);
             let departure = hop_time.max(busy);
             let free_at = departure + tx;
-            link_busy.insert((current, next), free_at);
+            admissions.push(((current, next), free_at));
             hop_time = free_at + link_latency;
         } else {
             hop_time += link_latency;
@@ -200,8 +249,13 @@ fn walk_per_link_bandwidth(
         current = next;
     }
 
+    // Commit admissions atomically now that the full path cleared.
+    for (key, t) in admissions {
+        link_busy.insert(key, t);
+    }
+
     let walk_elapsed = hop_time.saturating_duration_since(arrival_at_src_now);
-    walk_elapsed.saturating_sub(accumulated_link_latency)
+    PerLinkOutcome::Admitted(walk_elapsed.saturating_sub(accumulated_link_latency))
 }
 
 impl<P> Network<P, FixedLatency> {
@@ -435,11 +489,24 @@ impl<P, L: LatencyModel> Network<P, L> {
         };
 
         // Apply per-physical-link bandwidth serialization by walking the
-        // path. Each link may have its own cap and its own queue, shared
-        // across flows that traverse it. Returns the extra delay beyond
-        // `latency` that per-link transmission + queueing contributed.
+        // path. Each link may have its own cap + buffer, shared across
+        // flows that traverse it. Returns the extra delay beyond `latency`
+        // that per-link transmission + queueing contributed, or signals
+        // buffer overflow in which case the message is dropped.
         let link_bandwidth_delay = if size_bytes > 0 {
-            self.apply_per_link_bandwidth(src, dst, size_bytes, departure_time + pair_tx)
+            match self.apply_per_link_bandwidth(src, dst, size_bytes, departure_time + pair_tx) {
+                PerLinkOutcome::Admitted(d) => d,
+                PerLinkOutcome::Overflow => {
+                    self.sim.schedule(
+                        base_time,
+                        NetEvent::Drop {
+                            message,
+                            reason: DropReason::BufferOverflow,
+                        },
+                    );
+                    return Some(id);
+                }
+            }
         } else {
             Duration::ZERO
         };
@@ -458,7 +525,7 @@ impl<P, L: LatencyModel> Network<P, L> {
         dst: NodeId,
         size_bytes: u64,
         arrival_at_src_now: Time,
-    ) -> Duration {
+    ) -> PerLinkOutcome {
         walk_per_link_bandwidth(
             &mut self.topology,
             &mut self.link_busy,
@@ -589,14 +656,26 @@ impl<P, L: LatencyModel> Network<P, L> {
 
                 // Walk the path for per-link bandwidth.
                 let link_bandwidth_delay = if size_bytes > 0 {
-                    walk_per_link_bandwidth(
+                    match walk_per_link_bandwidth(
                         &mut ctx.topology,
                         &mut ctx.link_busy,
                         src,
                         dst,
                         size_bytes,
                         departure_time + pair_tx,
-                    )
+                    ) {
+                        PerLinkOutcome::Admitted(d) => d,
+                        PerLinkOutcome::Overflow => {
+                            sim.schedule(
+                                base_time,
+                                NetEvent::Drop {
+                                    message,
+                                    reason: DropReason::BufferOverflow,
+                                },
+                            );
+                            continue;
+                        }
+                    }
                 } else {
                     Duration::ZERO
                 };
@@ -1061,6 +1140,127 @@ mod tests {
         arrivals.sort_by_key(|(p, _)| *p);
         assert_eq!(arrivals[0], (0, Time::from_secs(1)));
         assert_eq!(arrivals[1], (1, Time::ZERO));
+    }
+
+    #[test]
+    fn unbounded_buffer_matches_prior_behavior() {
+        // A link with bandwidth but no buffer: any number of enqueued
+        // sends must be admitted (serialized, never dropped).
+        let topo = TopologyBuilder::new(2)
+            .link_with_capacity(0u32, 1u32, Duration::from_millis(0), 1_000_000)
+            .build();
+
+        let mut net: Network<u32> = Network::new(topo, 42);
+        for i in 0..5 {
+            net.send_sized(NodeId(0), NodeId(1), i, 1_000_000);
+        }
+        let stats = net.run(|_ctx, _event| {});
+        assert_eq!(stats.messages_delivered, 5);
+        assert_eq!(stats.messages_dropped, 0);
+    }
+
+    #[test]
+    fn buffer_overflow_drops_excess_sends() {
+        // 1 MB/s link with a 2 MB buffer: admits one in-flight + one
+        // queued (2 MB total un-transmitted); the third concurrent send
+        // would push the buffer to 3 MB and is therefore dropped.
+        let topo = TopologyBuilder::new(2)
+            .link_with_capacity_and_buffer(
+                0u32,
+                1u32,
+                Duration::from_millis(0),
+                1_000_000,
+                2_000_000,
+            )
+            .build();
+
+        let mut net: Network<u32> = Network::new(topo, 42);
+        let a = net.send_sized(NodeId(0), NodeId(1), 0, 1_000_000);
+        let b = net.send_sized(NodeId(0), NodeId(1), 1, 1_000_000);
+        let c = net.send_sized(NodeId(0), NodeId(1), 2, 1_000_000);
+        assert!(a.is_some() && b.is_some() && c.is_some());
+
+        let mut delivered = Vec::new();
+        let mut dropped = Vec::new();
+        let stats = net.run(|_ctx, event| match event {
+            NetEvent::Deliver(msg) => delivered.push(msg.payload),
+            NetEvent::Drop { message, reason } => dropped.push((message.payload, reason)),
+        });
+
+        assert_eq!(stats.messages_delivered, 2);
+        assert_eq!(stats.messages_dropped, 1);
+        assert_eq!(delivered, vec![0, 1]);
+        assert_eq!(dropped, vec![(2, DropReason::BufferOverflow)]);
+    }
+
+    #[test]
+    fn buffer_drains_over_time() {
+        // 1 MB/s link with a tight 1.5 MB buffer: sending a 1 MB payload
+        // every 2 seconds should always be admitted because the queue
+        // drains fully between sends (1 s of tx + 1 s idle).
+        let topo = TopologyBuilder::new(2)
+            .link_with_capacity_and_buffer(
+                0u32,
+                1u32,
+                Duration::from_millis(0),
+                1_000_000,
+                1_500_000,
+            )
+            .build();
+
+        let mut net: Network<u32> = Network::new(topo, 42);
+        for i in 0..4 {
+            net.send_at_sized(
+                Time::from_secs(2 * i),
+                NodeId(0),
+                NodeId(1),
+                i as u32,
+                1_000_000,
+            );
+        }
+        let stats = net.run(|_ctx, _event| {});
+        assert_eq!(stats.messages_delivered, 4);
+        assert_eq!(stats.messages_dropped, 0);
+    }
+
+    #[test]
+    fn overflow_on_shared_bottleneck_does_not_consume_upstream_capacity() {
+        // Topology: 0 --uncapped-- 1 --1 MB/s, 2 MB buffer-- 2
+        //           3 --uncapped--/
+        //
+        // Three 1 MB concurrent flows onto the bottleneck: one in flight,
+        // one queued, the third must overflow. Admission is atomic, so
+        // the overflow must not have mutated any link's state — a
+        // delivered-counts assertion is sufficient for the externally
+        // visible guarantee.
+        let topo = TopologyBuilder::new(4)
+            .link(0u32, 1u32, Duration::from_millis(1))
+            .link(3u32, 1u32, Duration::from_millis(1))
+            .link_with_capacity_and_buffer(
+                1u32,
+                2u32,
+                Duration::from_millis(0),
+                1_000_000,
+                2_000_000,
+            )
+            .build();
+
+        let mut net: Network<u32> = Network::new(topo, 42);
+        net.send_sized(NodeId(0), NodeId(2), 0, 1_000_000);
+        net.send_sized(NodeId(3), NodeId(2), 1, 1_000_000);
+        net.send_sized(NodeId(0), NodeId(2), 2, 1_000_000);
+
+        let mut delivered = Vec::new();
+        let mut dropped = Vec::new();
+        net.run(|_ctx, event| match event {
+            NetEvent::Deliver(msg) => delivered.push(msg.payload),
+            NetEvent::Drop { message, reason } => dropped.push((message.payload, reason)),
+        });
+
+        // Exactly one overflow drop; the other two arrive.
+        assert_eq!(delivered.len(), 2);
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(dropped[0].1, DropReason::BufferOverflow);
     }
 
     #[test]

@@ -45,6 +45,8 @@ pub enum NetTraceDropReason {
     PacketLoss,
     /// Active network partition between source and destination.
     Partitioned,
+    /// A per-link buffer on the path was full at admission time.
+    BufferOverflow,
 }
 
 impl From<DropReason> for NetTraceDropReason {
@@ -53,6 +55,7 @@ impl From<DropReason> for NetTraceDropReason {
             DropReason::NoRoute => NetTraceDropReason::NoRoute,
             DropReason::PacketLoss => NetTraceDropReason::PacketLoss,
             DropReason::Partitioned => NetTraceDropReason::Partitioned,
+            DropReason::BufferOverflow => NetTraceDropReason::BufferOverflow,
         }
     }
 }

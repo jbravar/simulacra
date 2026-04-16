@@ -18,6 +18,16 @@ pub struct Link {
     pub latency: Duration,
     /// Optional bandwidth cap in bytes per second. `None` means uncapped.
     pub bandwidth: Option<u64>,
+    /// Optional per-link buffer capacity in bytes.
+    ///
+    /// Only meaningful when `bandwidth` is set. Represents the total
+    /// number of *un-transmitted* bytes the link can hold at any instant,
+    /// including the message currently being serialized plus all messages
+    /// waiting behind it. Incoming sends whose admission would push this
+    /// total past `buffer_bytes` are dropped with
+    /// `DropReason::BufferOverflow`. `None` means an unbounded queue (the
+    /// default for backwards compatibility).
+    pub buffer_bytes: Option<u64>,
 }
 
 /// Dijkstra priority-queue entry. Defined at module level so that scratch
@@ -118,7 +128,7 @@ impl Topology {
     ///
     /// Clears cached routes since the topology has changed.
     pub fn add_link(&mut self, src: NodeId, dst: NodeId, latency: Duration) {
-        self.add_link_with_bandwidth(src, dst, latency, None);
+        self.add_link_full(src, dst, latency, None, None);
     }
 
     /// Adds a directed link with an optional bandwidth cap (bytes/sec).
@@ -129,12 +139,27 @@ impl Topology {
         latency: Duration,
         bandwidth: Option<u64>,
     ) {
+        self.add_link_full(src, dst, latency, bandwidth, None);
+    }
+
+    /// Adds a directed link with an optional bandwidth cap and an optional
+    /// per-link buffer in bytes. A buffer only has an effect when
+    /// `bandwidth` is also set.
+    pub fn add_link_full(
+        &mut self,
+        src: NodeId,
+        dst: NodeId,
+        latency: Duration,
+        bandwidth: Option<u64>,
+        buffer_bytes: Option<u64>,
+    ) {
         self.clear_route_cache();
         if src.as_usize() < self.node_count && dst.as_usize() < self.node_count {
             self.adjacency[src.as_usize()].push(Link {
                 target: dst,
                 latency,
                 bandwidth,
+                buffer_bytes,
             });
         }
     }
@@ -342,9 +367,9 @@ impl TopologyBuilder {
 
     /// Adds a bidirectional link with a symmetric bandwidth cap (bytes/sec).
     ///
-    /// Per-link bandwidth is applied by [`Network::send_sized`] and stacks
-    /// independently per direction (each direction has its own serialization
-    /// queue in the network runtime).
+    /// Per-link bandwidth is applied by [`Network::send_sized`](crate::net::Network::send_sized)
+    /// and stacks independently per direction (each direction has its own
+    /// serialization queue in the network runtime).
     pub fn link_with_capacity(
         mut self,
         a: impl Into<NodeId>,
@@ -370,6 +395,48 @@ impl TopologyBuilder {
     ) -> Self {
         self.topology
             .add_link_with_bandwidth(src.into(), dst.into(), latency, Some(bandwidth_bps));
+        self
+    }
+
+    /// Adds a bidirectional link with a bandwidth cap and a per-link buffer
+    /// (in bytes) applied in each direction.
+    ///
+    /// Messages whose arrival would push the in-flight byte count over
+    /// `buffer_bytes` are dropped with
+    /// [`DropReason::BufferOverflow`](crate::net::DropReason::BufferOverflow).
+    pub fn link_with_capacity_and_buffer(
+        mut self,
+        a: impl Into<NodeId>,
+        b: impl Into<NodeId>,
+        latency: Duration,
+        bandwidth_bps: u64,
+        buffer_bytes: u64,
+    ) -> Self {
+        let a = a.into();
+        let b = b.into();
+        let bw = Some(bandwidth_bps);
+        let buf = Some(buffer_bytes);
+        self.topology.add_link_full(a, b, latency, bw, buf);
+        self.topology.add_link_full(b, a, latency, bw, buf);
+        self
+    }
+
+    /// Adds a directed link with a bandwidth cap and a per-link buffer.
+    pub fn directed_link_with_capacity_and_buffer(
+        mut self,
+        src: impl Into<NodeId>,
+        dst: impl Into<NodeId>,
+        latency: Duration,
+        bandwidth_bps: u64,
+        buffer_bytes: u64,
+    ) -> Self {
+        self.topology.add_link_full(
+            src.into(),
+            dst.into(),
+            latency,
+            Some(bandwidth_bps),
+            Some(buffer_bytes),
+        );
         self
     }
 
