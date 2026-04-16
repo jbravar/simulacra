@@ -108,8 +108,15 @@ pub struct Network<P, L: LatencyModel = FixedLatency> {
     /// A `(src, dst)` pair present in this map has a bandwidth limit; each
     /// sized send between that pair blocks the next one until the link
     /// finishes "transmitting" the current message. Pairs not in the map
-    /// are uncapped (classic `send()` behavior).
+    /// are uncapped (classic `send()` behavior). This is an end-to-end
+    /// model; it is layered on top of any per-physical-link bandwidth caps
+    /// declared on the `Topology`.
     bandwidths: std::collections::HashMap<(NodeId, NodeId), BandwidthState>,
+    /// Earliest time each directed physical link is free to start
+    /// transmitting a new message. Populated lazily for links that
+    /// participate in a `send_sized` call. Models realistic per-link
+    /// serialization (e.g., multiple flows sharing a bottleneck WAN link).
+    link_busy: std::collections::HashMap<(NodeId, NodeId), Time>,
 }
 
 /// Per-`(src, dst)` bandwidth state for the optional end-to-end cap.
@@ -141,6 +148,62 @@ fn partition_key(a: NodeId, b: NodeId) -> (NodeId, NodeId) {
     }
 }
 
+/// Walks the shortest path from `src` to `dst` hop-by-hop, applying per-link
+/// bandwidth serialization for a message of `size_bytes` bytes.
+///
+/// Mutates `link_busy` for every link with a configured bandwidth cap.
+/// Returns only the *extra* delay induced by bandwidth; the link latencies
+/// themselves are assumed to already be accounted for by the caller (via
+/// `latency_model.compute(route.total_latency)`). This keeps the latency
+/// model's jitter behavior consistent between sized and unsized sends.
+///
+/// `arrival_at_src_now` is the time at which the message's first byte is
+/// ready to enter the network at `src` (i.e., after any pair-level
+/// serialization has already run).
+fn walk_per_link_bandwidth(
+    topology: &mut Topology,
+    link_busy: &mut std::collections::HashMap<(NodeId, NodeId), Time>,
+    src: NodeId,
+    dst: NodeId,
+    size_bytes: u64,
+    arrival_at_src_now: Time,
+) -> Duration {
+    let mut current = src;
+    let mut hop_time = arrival_at_src_now;
+    let mut accumulated_link_latency = Duration::ZERO;
+
+    while current != dst {
+        let next = match topology.route(current, dst) {
+            Some(r) if r.hop_count > 0 => r.next_hop,
+            _ => return Duration::ZERO,
+        };
+
+        let link = topology.link_between(current, next);
+        let link_latency = link.map(|l| l.latency).unwrap_or(Duration::ZERO);
+        let link_bandwidth = link.and_then(|l| l.bandwidth);
+
+        if let Some(bps) = link_bandwidth {
+            let tx = transmission_duration(bps, size_bytes);
+            let busy = link_busy
+                .get(&(current, next))
+                .copied()
+                .unwrap_or(Time::ZERO);
+            let departure = hop_time.max(busy);
+            let free_at = departure + tx;
+            link_busy.insert((current, next), free_at);
+            hop_time = free_at + link_latency;
+        } else {
+            hop_time += link_latency;
+        }
+
+        accumulated_link_latency += link_latency;
+        current = next;
+    }
+
+    let walk_elapsed = hop_time.saturating_duration_since(arrival_at_src_now);
+    walk_elapsed.saturating_sub(accumulated_link_latency)
+}
+
 impl<P> Network<P, FixedLatency> {
     /// Creates a new network simulation with the given topology.
     pub fn new(topology: Topology, seed: u64) -> Self {
@@ -153,6 +216,7 @@ impl<P> Network<P, FixedLatency> {
             config: NetConfig::default(),
             partitions: std::collections::HashSet::new(),
             bandwidths: std::collections::HashMap::new(),
+            link_busy: std::collections::HashMap::new(),
         }
     }
 }
@@ -169,6 +233,7 @@ impl<P, L: LatencyModel> Network<P, L> {
             config: NetConfig::default(),
             partitions: std::collections::HashSet::new(),
             bandwidths: std::collections::HashMap::new(),
+            link_busy: std::collections::HashMap::new(),
         }
     }
 
@@ -357,8 +422,8 @@ impl<P, L: LatencyModel> Network<P, L> {
             .latency_model
             .compute(route.total_latency, &mut self.rng);
 
-        // Apply bandwidth serialization if configured for this direction.
-        let (departure_time, transmission) = match self.bandwidths.get_mut(&(src, dst)) {
+        // Apply pair-level bandwidth serialization (end-to-end model).
+        let (departure_time, pair_tx) = match self.bandwidths.get_mut(&(src, dst)) {
             Some(state) if size_bytes > 0 => {
                 let earliest = base_time.max(state.link_free_at);
                 let tx = transmission_duration(state.bps, size_bytes);
@@ -369,9 +434,39 @@ impl<P, L: LatencyModel> Network<P, L> {
             _ => (base_time, Duration::ZERO),
         };
 
-        let delivery_time = departure_time + transmission + latency;
+        // Apply per-physical-link bandwidth serialization by walking the
+        // path. Each link may have its own cap and its own queue, shared
+        // across flows that traverse it. Returns the extra delay beyond
+        // `latency` that per-link transmission + queueing contributed.
+        let link_bandwidth_delay = if size_bytes > 0 {
+            self.apply_per_link_bandwidth(src, dst, size_bytes, departure_time + pair_tx)
+        } else {
+            Duration::ZERO
+        };
+
+        let delivery_time = departure_time + pair_tx + latency + link_bandwidth_delay;
         self.sim.schedule(delivery_time, NetEvent::Deliver(message));
         Some(id)
+    }
+
+    /// Walks the shortest path from `src` to `dst`, accumulating per-link
+    /// transmission + serialization delay for a message of `size_bytes`.
+    /// See [`walk_per_link_bandwidth`] for the underlying algorithm.
+    fn apply_per_link_bandwidth(
+        &mut self,
+        src: NodeId,
+        dst: NodeId,
+        size_bytes: u64,
+        arrival_at_src_now: Time,
+    ) -> Duration {
+        walk_per_link_bandwidth(
+            &mut self.topology,
+            &mut self.link_busy,
+            src,
+            dst,
+            size_bytes,
+            arrival_at_src_now,
+        )
     }
 
     /// Schedules a raw network event.
@@ -403,6 +498,7 @@ impl<P, L: LatencyModel> Network<P, L> {
             config,
             partitions,
             bandwidths,
+            link_busy,
         } = self;
 
         let mut ctx = RunContext {
@@ -414,6 +510,7 @@ impl<P, L: LatencyModel> Network<P, L> {
             config,
             partitions,
             bandwidths,
+            link_busy,
             delivered: 0,
             dropped: 0,
             pending_sends: Vec::new(),
@@ -479,7 +576,7 @@ impl<P, L: LatencyModel> Network<P, L> {
                 let latency = ctx.latency_model.compute(route.total_latency, &mut ctx.rng);
 
                 let base_time = sim.now();
-                let (departure_time, transmission) = match ctx.bandwidths.get_mut(&(src, dst)) {
+                let (departure_time, pair_tx) = match ctx.bandwidths.get_mut(&(src, dst)) {
                     Some(state) if size_bytes > 0 => {
                         let earliest = base_time.max(state.link_free_at);
                         let tx = transmission_duration(state.bps, size_bytes);
@@ -489,7 +586,22 @@ impl<P, L: LatencyModel> Network<P, L> {
                     }
                     _ => (base_time, Duration::ZERO),
                 };
-                let delivery_time = departure_time + transmission + latency;
+
+                // Walk the path for per-link bandwidth.
+                let link_bandwidth_delay = if size_bytes > 0 {
+                    walk_per_link_bandwidth(
+                        &mut ctx.topology,
+                        &mut ctx.link_busy,
+                        src,
+                        dst,
+                        size_bytes,
+                        departure_time + pair_tx,
+                    )
+                } else {
+                    Duration::ZERO
+                };
+
+                let delivery_time = departure_time + pair_tx + latency + link_bandwidth_delay;
                 sim.schedule(delivery_time, NetEvent::Deliver(message));
             }
         });
@@ -515,6 +627,7 @@ pub struct RunContext<P, L: LatencyModel> {
     config: NetConfig,
     partitions: std::collections::HashSet<(NodeId, NodeId)>,
     bandwidths: std::collections::HashMap<(NodeId, NodeId), BandwidthState>,
+    link_busy: std::collections::HashMap<(NodeId, NodeId), Time>,
     delivered: u64,
     dropped: u64,
     pending_sends: Vec<(NodeId, NodeId, P, u64)>,
@@ -830,6 +943,99 @@ mod tests {
         let stats = net.run(|_ctx, _event| {});
         assert_eq!(stats.messages_delivered, 1);
         assert_eq!(stats.final_time, Time::ZERO);
+    }
+
+    #[test]
+    fn per_link_bandwidth_on_direct_edge() {
+        // Same scenario as send_sized_delays_by_transmission_time, but the
+        // cap is declared on the physical link instead of pair-level.
+        let topo = TopologyBuilder::new(2)
+            .link_with_capacity(0u32, 1u32, Duration::from_millis(10), 1_000_000)
+            .build();
+
+        let mut net: Network<u32> = Network::new(topo, 42);
+        net.send_sized(NodeId(0), NodeId(1), 0, 1_000);
+
+        let stats = net.run(|_ctx, _event| {});
+        assert_eq!(stats.messages_delivered, 1);
+        // 10ms latency + 1ms tx = 11ms.
+        assert_eq!(stats.final_time, Time::from_millis(11));
+    }
+
+    #[test]
+    fn per_link_bandwidth_bottleneck_middle_of_path() {
+        // 3 nodes linear: 0 -- 1 -- 2.
+        // 0->1: uncapped, 1ms. 1->2: 1 MB/s cap, 1ms latency.
+        // Send a 1 MB message from 0 to 2. Expected timing:
+        //   - 0->1: 1ms (latency, no tx)
+        //   - 1->2: 1s tx + 1ms latency
+        //   Total: 1.002s latency + 0 bandwidth delay from 0->1 + 1s bw from 1->2.
+        let topo = TopologyBuilder::new(3)
+            .link(0u32, 1u32, Duration::from_millis(1))
+            .link_with_capacity(1u32, 2u32, Duration::from_millis(1), 1_000_000)
+            .build();
+
+        let mut net: Network<u32> = Network::new(topo, 42);
+        net.send_sized(NodeId(0), NodeId(2), 0, 1_000_000);
+
+        let stats = net.run(|_ctx, _event| {});
+        assert_eq!(stats.messages_delivered, 1);
+        // 2ms link latency + 1s tx on the bottleneck = 1.002s.
+        assert_eq!(stats.final_time, Time::from_millis(1002));
+    }
+
+    #[test]
+    fn per_link_bandwidth_shared_across_flows() {
+        // Two senders both flow through a shared bottleneck link 1->2.
+        // Topology: 0 --uncapped-- 1 --1 MB/s-- 2
+        //           3 --uncapped--/
+        // Each sends a 500 KB message at t=0 to node 2. The bottleneck
+        // serializes them: first arrives at ~501ms, second at ~1001ms.
+        let topo = TopologyBuilder::new(4)
+            .link(0u32, 1u32, Duration::from_millis(1))
+            .link(3u32, 1u32, Duration::from_millis(1))
+            .link_with_capacity(1u32, 2u32, Duration::from_millis(0), 1_000_000)
+            .build();
+
+        let mut net: Network<u32> = Network::new(topo, 42);
+        net.send_sized(NodeId(0), NodeId(2), 0, 500_000);
+        net.send_sized(NodeId(3), NodeId(2), 1, 500_000);
+
+        let mut arrivals = Vec::new();
+        net.run(|ctx, event| {
+            if let NetEvent::Deliver(msg) = event {
+                arrivals.push((msg.payload, ctx.now()));
+            }
+        });
+        arrivals.sort_by_key(|(_, t)| *t);
+
+        assert_eq!(arrivals.len(), 2);
+        // First message: 1ms ingress + 500ms bw = 501ms.
+        assert_eq!(arrivals[0].1, Time::from_millis(501));
+        // Second message: queued behind the first on link 1->2 — departs
+        // the link at 1s instead of 500ms, so arrival is 1001ms.
+        assert_eq!(arrivals[1].1, Time::from_millis(1001));
+    }
+
+    #[test]
+    fn per_link_and_pair_bandwidth_stack() {
+        // Pair-level cap 2 MB/s at endpoints + per-link cap 1 MB/s on the
+        // wire. The tighter cap (per-link) dominates for the tx time, plus
+        // the pair adds its own serialization at the source.
+        let topo = TopologyBuilder::new(2)
+            .link_with_capacity(0u32, 1u32, Duration::from_millis(0), 1_000_000)
+            .build();
+
+        let mut net: Network<u32> = Network::new(topo, 42);
+        net.set_bandwidth(NodeId(0), NodeId(1), 2_000_000);
+
+        // Send 1 MB. Pair tx = 0.5s. Per-link tx = 1s.
+        // Delivery = 0 + 0.5s (pair) + 1s (link tx) + 0 latency = 1.5s.
+        net.send_sized(NodeId(0), NodeId(1), 0, 1_000_000);
+
+        let stats = net.run(|_ctx, _event| {});
+        assert_eq!(stats.messages_delivered, 1);
+        assert_eq!(stats.final_time, Time::from_millis(1500));
     }
 
     #[test]

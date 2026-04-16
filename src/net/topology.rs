@@ -9,13 +9,15 @@ use std::collections::BinaryHeap;
 use super::node::NodeId;
 use crate::time::Duration;
 
-/// A link between two nodes with associated latency.
+/// A link between two nodes with associated latency and optional bandwidth.
 #[derive(Debug, Clone, Copy)]
 pub struct Link {
     /// The target node of this link.
     pub target: NodeId,
     /// Base latency for messages traversing this link.
     pub latency: Duration,
+    /// Optional bandwidth cap in bytes per second. `None` means uncapped.
+    pub bandwidth: Option<u64>,
 }
 
 /// Dijkstra priority-queue entry. Defined at module level so that scratch
@@ -104,15 +106,28 @@ impl Topology {
         (0..self.node_count).map(|i| NodeId::new(i as u32))
     }
 
-    /// Adds a directed link from `src` to `dst` with the given latency.
+    /// Adds a directed link from `src` to `dst` with the given latency and
+    /// no bandwidth cap.
     ///
     /// Clears cached routes since the topology has changed.
     pub fn add_link(&mut self, src: NodeId, dst: NodeId, latency: Duration) {
+        self.add_link_with_bandwidth(src, dst, latency, None);
+    }
+
+    /// Adds a directed link with an optional bandwidth cap (bytes/sec).
+    pub fn add_link_with_bandwidth(
+        &mut self,
+        src: NodeId,
+        dst: NodeId,
+        latency: Duration,
+        bandwidth: Option<u64>,
+    ) {
         self.clear_route_cache();
         if src.as_usize() < self.node_count && dst.as_usize() < self.node_count {
             self.adjacency[src.as_usize()].push(Link {
                 target: dst,
                 latency,
+                bandwidth,
             });
         }
     }
@@ -123,6 +138,18 @@ impl Topology {
     pub fn add_bidi_link(&mut self, a: NodeId, b: NodeId, latency: Duration) {
         self.add_link(a, b, latency);
         self.add_link(b, a, latency);
+    }
+
+    /// Returns the first directed `Link` from `src` to `dst`, if one exists.
+    ///
+    /// Used by the network layer to look up per-hop properties (latency,
+    /// bandwidth) while walking a route. If the graph has parallel edges,
+    /// this returns the one that was inserted first.
+    pub fn link_between(&self, src: NodeId, dst: NodeId) -> Option<&Link> {
+        self.adjacency
+            .get(src.as_usize())?
+            .iter()
+            .find(|l| l.target == dst)
     }
 
     /// Returns the outgoing links from a node.
@@ -295,6 +322,39 @@ impl TopologyBuilder {
         let b = b.into();
         self.topology.add_link(a, b, lat_ab);
         self.topology.add_link(b, a, lat_ba);
+        self
+    }
+
+    /// Adds a bidirectional link with a symmetric bandwidth cap (bytes/sec).
+    ///
+    /// Per-link bandwidth is applied by [`Network::send_sized`] and stacks
+    /// independently per direction (each direction has its own serialization
+    /// queue in the network runtime).
+    pub fn link_with_capacity(
+        mut self,
+        a: impl Into<NodeId>,
+        b: impl Into<NodeId>,
+        latency: Duration,
+        bandwidth_bps: u64,
+    ) -> Self {
+        let a = a.into();
+        let b = b.into();
+        let bw = Some(bandwidth_bps);
+        self.topology.add_link_with_bandwidth(a, b, latency, bw);
+        self.topology.add_link_with_bandwidth(b, a, latency, bw);
+        self
+    }
+
+    /// Adds a directed link with a bandwidth cap in bytes/sec.
+    pub fn directed_link_with_capacity(
+        mut self,
+        src: impl Into<NodeId>,
+        dst: impl Into<NodeId>,
+        latency: Duration,
+        bandwidth_bps: u64,
+    ) -> Self {
+        self.topology
+            .add_link_with_bandwidth(src.into(), dst.into(), latency, Some(bandwidth_bps));
         self
     }
 
