@@ -54,10 +54,12 @@ pub struct Topology {
     node_count: usize,
     /// Adjacency list: for each node, a list of outgoing links.
     adjacency: Vec<Vec<Link>>,
-    /// Dense route cache indexed by `src * node_count + dst`. `None` means
-    /// not yet computed; unreachable pairs are left as `None` since
+    /// Dense route cache indexed by `src * node_count + dst`. Lazily
+    /// allocated on the first successful `route()` call and torn down
+    /// (set back to `None`) whenever the topology is mutated. Individual
+    /// unreachable pairs are left as `None` within the cache since
     /// recomputing them is cheap and avoids a three-state enum.
-    routes: Vec<Option<Route>>,
+    routes: Option<Vec<Option<Route>>>,
     /// Scratch buffer for Dijkstra distances, sized to `node_count`.
     dist_scratch: Vec<u64>,
     /// Scratch buffer for Dijkstra predecessors, sized to `node_count`.
@@ -79,11 +81,16 @@ pub struct Route {
 
 impl Topology {
     /// Creates a new topology with the given number of nodes and no links.
+    ///
+    /// The route cache is not allocated here; it is created lazily on the
+    /// first successful `route()` call. This keeps construction and
+    /// mutation (`add_link`, `add_bidi_link`) O(1) with respect to
+    /// `node_count` even though the cache itself is O(N²).
     pub fn new(node_count: usize) -> Self {
         Topology {
             node_count,
             adjacency: vec![Vec::new(); node_count],
-            routes: vec![None; node_count * node_count],
+            routes: None,
             dist_scratch: Vec::with_capacity(node_count),
             prev_scratch: Vec::with_capacity(node_count),
             heap_scratch: BinaryHeap::new(),
@@ -163,7 +170,9 @@ impl Topology {
     /// Computes and returns the shortest-path route from `src` to `dst`.
     ///
     /// Returns `None` if there is no path between the nodes.
-    /// Routes are cached for subsequent lookups.
+    /// Routes are cached for subsequent lookups. The cache is allocated
+    /// lazily on the first call, so topologies that never route don't pay
+    /// the O(N²) allocation cost.
     pub fn route(&mut self, src: NodeId, dst: NodeId) -> Option<Route> {
         if src == dst {
             return Some(Route {
@@ -173,15 +182,20 @@ impl Topology {
             });
         }
 
-        // Check cache first
         let idx = self.route_idx(src, dst);
-        if let Some(route) = self.routes[idx] {
+
+        // Fast path: cache populated and hit.
+        if let Some(cache) = self.routes.as_ref()
+            && let Some(route) = cache[idx]
+        {
             return Some(route);
         }
 
-        // Compute shortest path using Dijkstra's algorithm
+        // Slow path: compute and (lazily) allocate the cache.
         let route = self.compute_route(src, dst)?;
-        self.routes[idx] = Some(route);
+        let n = self.node_count;
+        let cache = self.routes.get_or_insert_with(|| vec![None; n * n]);
+        cache[idx] = Some(route);
         Some(route)
     }
 
@@ -268,10 +282,11 @@ impl Topology {
     }
 
     /// Clears the route cache.
+    ///
+    /// Drops the entire cache allocation (O(1)). The next `route()` call
+    /// will reallocate lazily.
     pub fn clear_route_cache(&mut self) {
-        for slot in &mut self.routes {
-            *slot = None;
-        }
+        self.routes = None;
     }
 }
 

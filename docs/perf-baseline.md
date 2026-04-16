@@ -14,6 +14,10 @@ regressions) has something concrete to compare against.
   - `Topology` reuses Dijkstra scratch buffers (`dist`, `prev`, `heap`).
   - Route cache switched from `HashMap<(NodeId, NodeId), Route>` to a dense
     `Vec<Option<Route>>` indexed by `src * node_count + dst`.
+- **v0.1.0 + lazy-cache** — after making the route cache lazy
+  (`Option<Vec<Option<Route>>>`). `clear_route_cache` is O(1) and
+  construction + `add_link` no longer have to zero N² slots. Fixes what was
+  effectively O(N³) star-topology construction.
 
 ## Machine
 
@@ -49,18 +53,18 @@ Worst-case tie-breaking: all events at `Time::ZERO`.
 
 Star topology with 1 hub broadcasting to N−1 leaves.
 
-| N     | v0.1.0 init | + phase-6 | delta |
-| ----- | ----------- | --------- | ----- |
-| 32    | 878 ns      | ~935 ns   | +6%   |
-| 256   | 9.90 µs     | ~11.4 µs  | +15%  |
-| 1,024 | 52.6 µs     | ~48.6 µs  | -8%   |
+| N     | v0.1.0 init | + phase-6 | + lazy-cache | vs. init |
+| ----- | ----------- | --------- | ------------ | -------- |
+| 32    | 878 ns      | ~935 ns   | ~920 ns      | +5%      |
+| 256   | 9.90 µs     | ~11.4 µs  | ~9.77 µs     | -1%      |
+| 1,024 | 52.6 µs     | ~48.6 µs  | ~53.2 µs     | +1%      |
 
-The small regressions at N=32 and N=256 come from up-front allocation of the
-dense O(N²) `Vec<Option<Route>>` cache (pre-zeroed) on every fresh
-`Network`. The 1,024-node case benefits from O(1) cache lookup vs. hash
-probing. If this becomes a problem for very small-N workloads, the cache
-could be made lazy (e.g., `Box<[Option<Route>]>` initialized on first
-insert).
+The lazy-cache pass recovered most of the phase-6 small-N regressions
+(N=256 is back to parity), at the cost of a small regression on the
+larger N=1,024 case that was benefitting from eager allocation of a
+warm, contiguous cache. Overall within ~5% of the initial baseline for
+all sizes, and construction of a star topology is now O(N) again
+instead of O(N³).
 
 ### `task/ring_gossip`
 
@@ -68,11 +72,16 @@ N async nodes in a ring, one message circulates once (N forwards total).
 This is where Phase 6 pays off — every iteration used to allocate a fresh
 `Vec<TaskId>` and re-run Dijkstra from scratch.
 
-| N   | v0.1.0 init | + phase-6 | delta |
-| --- | ----------- | --------- | ----- |
-| 16  | 3.90 µs     | ~2.03 µs  | -48%  |
-| 64  | 17.7 µs     | ~16.2 µs  | -9%   |
-| 256 | 82.8 µs     | ~49.2 µs  | -41%  |
+| N   | v0.1.0 init | + phase-6 | + lazy-cache | vs. init |
+| --- | ----------- | --------- | ------------ | -------- |
+| 16  | 3.90 µs     | ~2.03 µs  | ~2.05 µs     | -47%     |
+| 64  | 17.7 µs     | ~16.2 µs  | ~9.83 µs     | -44%     |
+| 256 | 82.8 µs     | ~49.2 µs  | ~66.3 µs     | -20%     |
+
+Criterion flags the N=64 and N=256 deltas as within noise at
+`--quick` sampling (p > 0.05), so run `cargo bench` proper for a
+firmer picture. Even on the high end of the noise band, all sizes
+remain comfortably ahead of the original baseline.
 
 ## Takeaways
 
