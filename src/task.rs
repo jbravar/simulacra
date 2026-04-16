@@ -510,6 +510,7 @@ impl<M: 'static> TaskSimBuilder<M> {
             state,
             tasks,
             seed: self.seed,
+            ready_scratch: Vec::new(),
         }
     }
 }
@@ -534,6 +535,11 @@ pub struct TaskSim<M: 'static> {
     state: Rc<RefCell<SimState<M>>>,
     tasks: Vec<Task>,
     seed: u64,
+    /// Reusable scratch buffer for the ready-task drain in `run_until`.
+    ///
+    /// Holding it here lets us swap with `state.ready_tasks` each iteration
+    /// and reuse its allocation across the whole run.
+    ready_scratch: Vec<TaskId>,
 }
 
 impl<M: Clone + 'static> TaskSim<M> {
@@ -591,13 +597,17 @@ impl<M: Clone + 'static> TaskSim<M> {
         let mut stats = TaskSimStats::default();
 
         loop {
-            // Poll all ready tasks
-            let ready_tasks: Vec<TaskId> = {
+            // Swap the ready queue out into a scratch buffer we own, so we
+            // can iterate it without holding a borrow on `state` during
+            // poll (polls reborrow `state` to schedule further events).
+            // Reusing the buffer across iterations avoids a per-loop alloc.
+            self.ready_scratch.clear();
+            {
                 let mut state = self.state.borrow_mut();
-                std::mem::take(&mut state.ready_tasks)
-            };
+                std::mem::swap(&mut self.ready_scratch, &mut state.ready_tasks);
+            }
 
-            for task_id in ready_tasks {
+            for &task_id in &self.ready_scratch {
                 if let Some(task) = self.tasks.get_mut(task_id.0 as usize) {
                     if task.completed {
                         continue;

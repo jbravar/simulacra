@@ -4,7 +4,7 @@
 //! has an associated latency.
 
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::BinaryHeap;
 
 use super::node::NodeId;
 use crate::time::Duration;
@@ -18,6 +18,30 @@ pub struct Link {
     pub latency: Duration,
 }
 
+/// Dijkstra priority-queue entry. Defined at module level so that scratch
+/// `BinaryHeap`s can be stored on `Topology` without leaking the type.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct DijkstraState {
+    cost: u64,
+    node: NodeId,
+}
+
+impl Ord for DijkstraState {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Min-heap on cost, tie-break by node id for determinism.
+        other
+            .cost
+            .cmp(&self.cost)
+            .then_with(|| self.node.cmp(&other.node))
+    }
+}
+
+impl PartialOrd for DijkstraState {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 /// A network topology represented as an adjacency list.
 ///
 /// Supports both directed and undirected links, shortest-path routing,
@@ -28,9 +52,16 @@ pub struct Topology {
     node_count: usize,
     /// Adjacency list: for each node, a list of outgoing links.
     adjacency: Vec<Vec<Link>>,
-    /// Cached shortest paths (lazily computed).
-    /// Maps (src, dst) -> (next_hop, total_latency)
-    routes: HashMap<(NodeId, NodeId), Route>,
+    /// Dense route cache indexed by `src * node_count + dst`. `None` means
+    /// not yet computed; unreachable pairs are left as `None` since
+    /// recomputing them is cheap and avoids a three-state enum.
+    routes: Vec<Option<Route>>,
+    /// Scratch buffer for Dijkstra distances, sized to `node_count`.
+    dist_scratch: Vec<u64>,
+    /// Scratch buffer for Dijkstra predecessors, sized to `node_count`.
+    prev_scratch: Vec<Option<NodeId>>,
+    /// Scratch priority queue for Dijkstra, reused across `route()` calls.
+    heap_scratch: BinaryHeap<DijkstraState>,
 }
 
 /// A computed route between two nodes.
@@ -50,8 +81,16 @@ impl Topology {
         Topology {
             node_count,
             adjacency: vec![Vec::new(); node_count],
-            routes: HashMap::new(),
+            routes: vec![None; node_count * node_count],
+            dist_scratch: Vec::with_capacity(node_count),
+            prev_scratch: Vec::with_capacity(node_count),
+            heap_scratch: BinaryHeap::new(),
         }
+    }
+
+    #[inline]
+    fn route_idx(&self, src: NodeId, dst: NodeId) -> usize {
+        src.as_usize() * self.node_count + dst.as_usize()
     }
 
     /// Returns the number of nodes in the topology.
@@ -69,7 +108,7 @@ impl Topology {
     ///
     /// Clears cached routes since the topology has changed.
     pub fn add_link(&mut self, src: NodeId, dst: NodeId, latency: Duration) {
-        self.routes.clear();
+        self.clear_route_cache();
         if src.as_usize() < self.node_count && dst.as_usize() < self.node_count {
             self.adjacency[src.as_usize()].push(Link {
                 target: dst,
@@ -108,62 +147,47 @@ impl Topology {
         }
 
         // Check cache first
-        if let Some(&route) = self.routes.get(&(src, dst)) {
+        let idx = self.route_idx(src, dst);
+        if let Some(route) = self.routes[idx] {
             return Some(route);
         }
 
         // Compute shortest path using Dijkstra's algorithm
         let route = self.compute_route(src, dst)?;
-        self.routes.insert((src, dst), route);
+        self.routes[idx] = Some(route);
         Some(route)
     }
 
-    /// Computes the route without caching.
-    fn compute_route(&self, src: NodeId, dst: NodeId) -> Option<Route> {
-        #[derive(Clone, Copy, Eq, PartialEq)]
-        struct State {
-            cost: u64,
-            node: NodeId,
-        }
-
-        impl Ord for State {
-            fn cmp(&self, other: &Self) -> Ordering {
-                other
-                    .cost
-                    .cmp(&self.cost)
-                    .then_with(|| self.node.cmp(&other.node))
-            }
-        }
-
-        impl PartialOrd for State {
-            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-                Some(self.cmp(other))
-            }
-        }
-
+    /// Computes the route without caching, reusing the scratch buffers on
+    /// `self`.
+    fn compute_route(&mut self, src: NodeId, dst: NodeId) -> Option<Route> {
         let n = self.node_count;
-        let mut dist = vec![u64::MAX; n];
-        let mut prev: Vec<Option<NodeId>> = vec![None; n];
-        let mut heap = BinaryHeap::new();
 
-        dist[src.as_usize()] = 0;
-        heap.push(State { cost: 0, node: src });
+        // Reset scratch buffers without freeing their allocations.
+        self.dist_scratch.clear();
+        self.dist_scratch.resize(n, u64::MAX);
+        self.prev_scratch.clear();
+        self.prev_scratch.resize(n, None);
+        self.heap_scratch.clear();
 
-        while let Some(State { cost, node }) = heap.pop() {
+        self.dist_scratch[src.as_usize()] = 0;
+        self.heap_scratch.push(DijkstraState { cost: 0, node: src });
+
+        while let Some(DijkstraState { cost, node }) = self.heap_scratch.pop() {
             if node == dst {
                 break;
             }
 
-            if cost > dist[node.as_usize()] {
+            if cost > self.dist_scratch[node.as_usize()] {
                 continue;
             }
 
             for link in &self.adjacency[node.as_usize()] {
                 let next_cost = cost.saturating_add(link.latency.as_nanos());
-                if next_cost < dist[link.target.as_usize()] {
-                    dist[link.target.as_usize()] = next_cost;
-                    prev[link.target.as_usize()] = Some(node);
-                    heap.push(State {
+                if next_cost < self.dist_scratch[link.target.as_usize()] {
+                    self.dist_scratch[link.target.as_usize()] = next_cost;
+                    self.prev_scratch[link.target.as_usize()] = Some(node);
+                    self.heap_scratch.push(DijkstraState {
                         cost: next_cost,
                         node: link.target,
                     });
@@ -172,12 +196,15 @@ impl Topology {
         }
 
         // No path found
-        prev[dst.as_usize()]?;
+        self.prev_scratch[dst.as_usize()]?;
 
-        // Reconstruct path to find next_hop and hop_count
-        let mut path = vec![dst];
+        // Reconstruct path to find next_hop and hop_count. Path length is
+        // bounded by the diameter of the graph (typically small), so we
+        // allocate a fresh Vec here rather than maintaining a scratch.
+        let mut path = Vec::with_capacity(8);
+        path.push(dst);
         let mut current = dst;
-        while let Some(p) = prev[current.as_usize()] {
+        while let Some(p) = self.prev_scratch[current.as_usize()] {
             path.push(p);
             current = p;
             if current == src {
@@ -195,7 +222,7 @@ impl Topology {
 
         Some(Route {
             next_hop,
-            total_latency: Duration::from_nanos(dist[dst.as_usize()]),
+            total_latency: Duration::from_nanos(self.dist_scratch[dst.as_usize()]),
             hop_count,
         })
     }
@@ -215,7 +242,9 @@ impl Topology {
 
     /// Clears the route cache.
     pub fn clear_route_cache(&mut self) {
-        self.routes.clear();
+        for slot in &mut self.routes {
+            *slot = None;
+        }
     }
 }
 
