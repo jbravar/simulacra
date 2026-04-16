@@ -87,6 +87,23 @@ impl<P, L: LatencyModel> TracedNetwork<P, L> {
         self.network.partition(a, b);
     }
 
+    /// Sets the bandwidth cap for `(src, dst)`. See
+    /// [`Network::set_bandwidth`].
+    pub fn set_bandwidth(&mut self, src: NodeId, dst: NodeId, bps: u64) {
+        self.network.set_bandwidth(src, dst, bps);
+    }
+
+    /// Sends a sized message. See [`Network::send_sized`].
+    pub fn send_sized(
+        &mut self,
+        src: NodeId,
+        dst: NodeId,
+        payload: P,
+        size_bytes: u64,
+    ) -> Option<crate::net::MessageId> {
+        self.network.send_sized(src, dst, payload, size_bytes)
+    }
+
     /// Removes a partition. See [`Network::heal`].
     pub fn heal(&mut self, a: NodeId, b: NodeId) {
         self.network.heal(a, b);

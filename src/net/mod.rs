@@ -103,6 +103,34 @@ pub struct Network<P, L: LatencyModel = FixedLatency> {
     /// the route. This is a coarse model, but matches what most callers want
     /// when simulating network failures.
     partitions: std::collections::HashSet<(NodeId, NodeId)>,
+    /// Per-direction end-to-end bandwidth caps, with serialization queueing.
+    ///
+    /// A `(src, dst)` pair present in this map has a bandwidth limit; each
+    /// sized send between that pair blocks the next one until the link
+    /// finishes "transmitting" the current message. Pairs not in the map
+    /// are uncapped (classic `send()` behavior).
+    bandwidths: std::collections::HashMap<(NodeId, NodeId), BandwidthState>,
+}
+
+/// Per-`(src, dst)` bandwidth state for the optional end-to-end cap.
+#[derive(Debug, Clone, Copy)]
+struct BandwidthState {
+    /// Bandwidth in bytes per second. Must be > 0.
+    bps: u64,
+    /// Earliest time the link is free to start transmitting a new message.
+    link_free_at: Time,
+}
+
+/// Computes the transmission time for a message of `size_bytes` bytes at
+/// `bps` bytes per second, rounded up to the next nanosecond.
+fn transmission_duration(bps: u64, size_bytes: u64) -> Duration {
+    if bps == 0 || size_bytes == 0 {
+        return Duration::ZERO;
+    }
+    // size_bytes * 1e9 / bps, rounded up.
+    let numerator = size_bytes.saturating_mul(1_000_000_000);
+    let nanos = numerator.div_ceil(bps);
+    Duration::from_nanos(nanos)
 }
 
 fn partition_key(a: NodeId, b: NodeId) -> (NodeId, NodeId) {
@@ -124,6 +152,7 @@ impl<P> Network<P, FixedLatency> {
             next_message_id: 0,
             config: NetConfig::default(),
             partitions: std::collections::HashSet::new(),
+            bandwidths: std::collections::HashMap::new(),
         }
     }
 }
@@ -139,7 +168,39 @@ impl<P, L: LatencyModel> Network<P, L> {
             next_message_id: 0,
             config: NetConfig::default(),
             partitions: std::collections::HashSet::new(),
+            bandwidths: std::collections::HashMap::new(),
         }
+    }
+
+    /// Installs an end-to-end bandwidth cap (in bytes per second) for
+    /// messages flowing from `src` to `dst`.
+    ///
+    /// Only affects [`Network::send_sized`] / [`Network::send_at_sized`]
+    /// calls between this pair; plain [`Network::send`] treats payload size
+    /// as 0 and is unaffected by the cap.
+    ///
+    /// Bandwidth is directional: set both `(a, b)` and `(b, a)` separately
+    /// if you want a symmetric pipe.
+    ///
+    /// Passing `bps == 0` clears the cap for that direction.
+    pub fn set_bandwidth(&mut self, src: NodeId, dst: NodeId, bps: u64) {
+        if bps == 0 {
+            self.bandwidths.remove(&(src, dst));
+        } else {
+            self.bandwidths
+                .entry((src, dst))
+                .and_modify(|s| s.bps = bps)
+                .or_insert(BandwidthState {
+                    bps,
+                    link_free_at: Time::ZERO,
+                });
+        }
+    }
+
+    /// Returns the configured bandwidth (bytes/sec) for `(src, dst)`, or
+    /// `None` if uncapped.
+    pub fn bandwidth(&self, src: NodeId, dst: NodeId) -> Option<u64> {
+        self.bandwidths.get(&(src, dst)).map(|s| s.bps)
     }
 
     /// Installs a symmetric partition between `a` and `b`.
@@ -188,69 +249,64 @@ impl<P, L: LatencyModel> Network<P, L> {
 
     /// Sends a message from `src` to `dst` with the given payload.
     ///
+    /// No bandwidth cap is applied (the message is treated as zero-sized).
+    /// Use [`Network::send_sized`] to include a message size and have any
+    /// configured bandwidth cap apply serialization delay + queueing.
+    ///
     /// Returns the message ID, or `None` if no route exists.
     pub fn send(&mut self, src: NodeId, dst: NodeId, payload: P) -> Option<MessageId> {
-        let id = MessageId::new(self.next_message_id);
-        self.next_message_id += 1;
-
-        let message = Message::new(id, src, dst, payload);
-
-        // Check for an active partition first.
-        if self.partitions.contains(&partition_key(src, dst)) {
-            self.sim.schedule(
-                self.sim.now(),
-                NetEvent::Drop {
-                    message,
-                    reason: DropReason::Partitioned,
-                },
-            );
-            return Some(id);
-        }
-
-        // Check for packet loss
-        if self.config.packet_loss > 0.0 && self.rng.bool(self.config.packet_loss) {
-            self.sim.schedule(
-                self.sim.now(),
-                NetEvent::Drop {
-                    message,
-                    reason: DropReason::PacketLoss,
-                },
-            );
-            return Some(id);
-        }
-
-        // Find route
-        let route = match self.topology.route(src, dst) {
-            Some(r) => r,
-            None => {
-                self.sim.schedule(
-                    self.sim.now(),
-                    NetEvent::Drop {
-                        message,
-                        reason: DropReason::NoRoute,
-                    },
-                );
-                return Some(id);
-            }
-        };
-
-        // Compute latency with model
-        let latency = self
-            .latency_model
-            .compute(route.total_latency, &mut self.rng);
-        let delivery_time = self.sim.now() + latency;
-
-        self.sim.schedule(delivery_time, NetEvent::Deliver(message));
-        Some(id)
+        self.enqueue_send(self.sim.now(), src, dst, payload, 0)
     }
 
-    /// Sends a message at a specific time.
+    /// Sends a message with an explicit size in bytes.
+    ///
+    /// If a bandwidth cap has been installed via [`Network::set_bandwidth`]
+    /// for `(src, dst)`, this send will be delayed by
+    /// `size_bytes / bps` seconds of transmission time, plus any
+    /// serialization queueing behind messages already scheduled on the link.
+    pub fn send_sized(
+        &mut self,
+        src: NodeId,
+        dst: NodeId,
+        payload: P,
+        size_bytes: u64,
+    ) -> Option<MessageId> {
+        self.enqueue_send(self.sim.now(), src, dst, payload, size_bytes)
+    }
+
+    /// Sends a message at a specific time (no bandwidth cap).
     pub fn send_at(
         &mut self,
         time: Time,
         src: NodeId,
         dst: NodeId,
         payload: P,
+    ) -> Option<MessageId> {
+        self.enqueue_send(time, src, dst, payload, 0)
+    }
+
+    /// Sends a sized message at a specific time.
+    pub fn send_at_sized(
+        &mut self,
+        time: Time,
+        src: NodeId,
+        dst: NodeId,
+        payload: P,
+        size_bytes: u64,
+    ) -> Option<MessageId> {
+        self.enqueue_send(time, src, dst, payload, size_bytes)
+    }
+
+    /// Core send path shared by `send`, `send_sized`, `send_at`, and
+    /// `send_at_sized`. Applies partition, loss, routing, latency, and
+    /// optional bandwidth serialization in a single place.
+    fn enqueue_send(
+        &mut self,
+        base_time: Time,
+        src: NodeId,
+        dst: NodeId,
+        payload: P,
+        size_bytes: u64,
     ) -> Option<MessageId> {
         let id = MessageId::new(self.next_message_id);
         self.next_message_id += 1;
@@ -260,7 +316,7 @@ impl<P, L: LatencyModel> Network<P, L> {
         // Check for an active partition first.
         if self.partitions.contains(&partition_key(src, dst)) {
             self.sim.schedule(
-                time,
+                base_time,
                 NetEvent::Drop {
                     message,
                     reason: DropReason::Partitioned,
@@ -269,10 +325,10 @@ impl<P, L: LatencyModel> Network<P, L> {
             return Some(id);
         }
 
-        // Check for packet loss
+        // Check for packet loss.
         if self.config.packet_loss > 0.0 && self.rng.bool(self.config.packet_loss) {
             self.sim.schedule(
-                time,
+                base_time,
                 NetEvent::Drop {
                     message,
                     reason: DropReason::PacketLoss,
@@ -281,12 +337,12 @@ impl<P, L: LatencyModel> Network<P, L> {
             return Some(id);
         }
 
-        // Find route
+        // Find route.
         let route = match self.topology.route(src, dst) {
             Some(r) => r,
             None => {
                 self.sim.schedule(
-                    time,
+                    base_time,
                     NetEvent::Drop {
                         message,
                         reason: DropReason::NoRoute,
@@ -296,12 +352,24 @@ impl<P, L: LatencyModel> Network<P, L> {
             }
         };
 
-        // Compute latency
+        // Compute latency with model.
         let latency = self
             .latency_model
             .compute(route.total_latency, &mut self.rng);
-        let delivery_time = time + latency;
 
+        // Apply bandwidth serialization if configured for this direction.
+        let (departure_time, transmission) = match self.bandwidths.get_mut(&(src, dst)) {
+            Some(state) if size_bytes > 0 => {
+                let earliest = base_time.max(state.link_free_at);
+                let tx = transmission_duration(state.bps, size_bytes);
+                let free_at = earliest + tx;
+                state.link_free_at = free_at;
+                (earliest, tx)
+            }
+            _ => (base_time, Duration::ZERO),
+        };
+
+        let delivery_time = departure_time + transmission + latency;
         self.sim.schedule(delivery_time, NetEvent::Deliver(message));
         Some(id)
     }
@@ -334,6 +402,7 @@ impl<P, L: LatencyModel> Network<P, L> {
             next_message_id,
             config,
             partitions,
+            bandwidths,
         } = self;
 
         let mut ctx = RunContext {
@@ -344,6 +413,7 @@ impl<P, L: LatencyModel> Network<P, L> {
             next_message_id,
             config,
             partitions,
+            bandwidths,
             delivered: 0,
             dropped: 0,
             pending_sends: Vec::new(),
@@ -364,7 +434,7 @@ impl<P, L: LatencyModel> Network<P, L> {
             handler(&mut ctx, event);
 
             // Process pending sends after handler completes
-            for (src, dst, payload) in ctx.pending_sends.drain(..) {
+            for (src, dst, payload, size_bytes) in ctx.pending_sends.drain(..) {
                 let id = MessageId::new(ctx.next_message_id);
                 ctx.next_message_id += 1;
 
@@ -407,7 +477,20 @@ impl<P, L: LatencyModel> Network<P, L> {
                 };
 
                 let latency = ctx.latency_model.compute(route.total_latency, &mut ctx.rng);
-                sim.schedule_in(latency, NetEvent::Deliver(message));
+
+                let base_time = sim.now();
+                let (departure_time, transmission) = match ctx.bandwidths.get_mut(&(src, dst)) {
+                    Some(state) if size_bytes > 0 => {
+                        let earliest = base_time.max(state.link_free_at);
+                        let tx = transmission_duration(state.bps, size_bytes);
+                        let free_at = earliest + tx;
+                        state.link_free_at = free_at;
+                        (earliest, tx)
+                    }
+                    _ => (base_time, Duration::ZERO),
+                };
+                let delivery_time = departure_time + transmission + latency;
+                sim.schedule(delivery_time, NetEvent::Deliver(message));
             }
         });
 
@@ -431,9 +514,10 @@ pub struct RunContext<P, L: LatencyModel> {
     next_message_id: u64,
     config: NetConfig,
     partitions: std::collections::HashSet<(NodeId, NodeId)>,
+    bandwidths: std::collections::HashMap<(NodeId, NodeId), BandwidthState>,
     delivered: u64,
     dropped: u64,
-    pending_sends: Vec<(NodeId, NodeId, P)>,
+    pending_sends: Vec<(NodeId, NodeId, P, u64)>,
 }
 
 impl<P, L: LatencyModel> RunContext<P, L> {
@@ -442,11 +526,40 @@ impl<P, L: LatencyModel> RunContext<P, L> {
         self.now
     }
 
-    /// Queues a message to be sent.
+    /// Queues a message to be sent. Message size is treated as 0, so any
+    /// configured bandwidth cap has no effect.
     ///
     /// The message will be processed after the current event handler returns.
     pub fn send(&mut self, src: NodeId, dst: NodeId, payload: P) {
-        self.pending_sends.push((src, dst, payload));
+        self.pending_sends.push((src, dst, payload, 0));
+    }
+
+    /// Queues a sized message to be sent. If a bandwidth cap is configured
+    /// for `(src, dst)`, it applies serialization delay + queueing.
+    pub fn send_sized(&mut self, src: NodeId, dst: NodeId, payload: P, size_bytes: u64) {
+        self.pending_sends.push((src, dst, payload, size_bytes));
+    }
+
+    /// Installs a bandwidth cap (bytes/sec) for `(src, dst)`, or clears it
+    /// if `bps == 0`. See [`Network::set_bandwidth`].
+    pub fn set_bandwidth(&mut self, src: NodeId, dst: NodeId, bps: u64) {
+        if bps == 0 {
+            self.bandwidths.remove(&(src, dst));
+        } else {
+            self.bandwidths
+                .entry((src, dst))
+                .and_modify(|s| s.bps = bps)
+                .or_insert(BandwidthState {
+                    bps,
+                    link_free_at: Time::ZERO,
+                });
+        }
+    }
+
+    /// Returns the configured bandwidth (bytes/sec) for `(src, dst)`, or
+    /// `None` if uncapped.
+    pub fn bandwidth(&self, src: NodeId, dst: NodeId) -> Option<u64> {
+        self.bandwidths.get(&(src, dst)).map(|s| s.bps)
     }
 
     /// Installs a partition between `a` and `b` in-flight.
@@ -614,6 +727,134 @@ mod tests {
 
         assert_eq!(stats.messages_delivered, 2);
         assert_eq!(messages, vec!["ping", "pong"]);
+    }
+
+    #[test]
+    fn transmission_duration_helper() {
+        // 1 MB at 1 MB/s = 1 second exactly.
+        assert_eq!(
+            transmission_duration(1_000_000, 1_000_000),
+            Duration::from_secs(1)
+        );
+        // Rounding: 1 byte at 3 B/s should round up to ceil(1e9 / 3) ns.
+        let d = transmission_duration(3, 1);
+        assert_eq!(d.as_nanos(), 333_333_334);
+        // Zero size or zero bps = zero duration.
+        assert_eq!(transmission_duration(0, 100), Duration::ZERO);
+        assert_eq!(transmission_duration(100, 0), Duration::ZERO);
+    }
+
+    #[test]
+    fn unsized_send_ignores_bandwidth() {
+        // Even with a tight cap, plain send() treats payload as 0-sized and
+        // therefore should not be delayed.
+        let topo = TopologyBuilder::new(2)
+            .link(0u32, 1u32, Duration::from_millis(10))
+            .build();
+
+        let mut net: Network<u32> = Network::new(topo, 42);
+        net.set_bandwidth(NodeId(0), NodeId(1), 1); // 1 byte/sec
+
+        net.send(NodeId(0), NodeId(1), 0);
+        net.send(NodeId(0), NodeId(1), 0);
+
+        let stats = net.run(|_ctx, _event| {});
+        assert_eq!(stats.messages_delivered, 2);
+        // Both arrive at base latency 10ms; bandwidth is not consulted.
+        assert_eq!(stats.final_time, Time::from_millis(10));
+    }
+
+    #[test]
+    fn send_sized_delays_by_transmission_time() {
+        // 1000 bytes @ 1 MB/s = 1ms of tx time, on top of the 10ms link.
+        let topo = TopologyBuilder::new(2)
+            .link(0u32, 1u32, Duration::from_millis(10))
+            .build();
+
+        let mut net: Network<u32> = Network::new(topo, 42);
+        net.set_bandwidth(NodeId(0), NodeId(1), 1_000_000);
+        assert_eq!(net.bandwidth(NodeId(0), NodeId(1)), Some(1_000_000));
+
+        net.send_sized(NodeId(0), NodeId(1), 0, 1_000);
+
+        let stats = net.run(|_ctx, _event| {});
+        assert_eq!(stats.messages_delivered, 1);
+        // 10ms (latency) + 1ms (tx) = 11ms.
+        assert_eq!(stats.final_time, Time::from_millis(11));
+    }
+
+    #[test]
+    fn bandwidth_serializes_concurrent_sends() {
+        // Three 1 MB messages over a 1 MB/s link: each takes 1s tx.
+        // They queue, so deliveries are at 1s, 2s, 3s (all + latency).
+        let topo = TopologyBuilder::new(2)
+            .link(0u32, 1u32, Duration::from_millis(0))
+            .build();
+
+        let mut net: Network<u32> = Network::new(topo, 42);
+        net.set_bandwidth(NodeId(0), NodeId(1), 1_000_000);
+
+        net.send_sized(NodeId(0), NodeId(1), 0, 1_000_000);
+        net.send_sized(NodeId(0), NodeId(1), 1, 1_000_000);
+        net.send_sized(NodeId(0), NodeId(1), 2, 1_000_000);
+
+        let mut arrivals = Vec::new();
+        net.run(|ctx, event| {
+            if let NetEvent::Deliver(msg) = event {
+                arrivals.push((msg.payload, ctx.now()));
+            }
+        });
+
+        arrivals.sort_by_key(|(_, t)| *t);
+        assert_eq!(arrivals.len(), 3);
+        assert_eq!(arrivals[0], (0, Time::from_secs(1)));
+        assert_eq!(arrivals[1], (1, Time::from_secs(2)));
+        assert_eq!(arrivals[2], (2, Time::from_secs(3)));
+    }
+
+    #[test]
+    fn set_bandwidth_zero_clears_cap() {
+        let topo = TopologyBuilder::new(2)
+            .link(0u32, 1u32, Duration::from_millis(0))
+            .build();
+
+        let mut net: Network<u32> = Network::new(topo, 42);
+        net.set_bandwidth(NodeId(0), NodeId(1), 1_000_000);
+        assert!(net.bandwidth(NodeId(0), NodeId(1)).is_some());
+
+        net.set_bandwidth(NodeId(0), NodeId(1), 0);
+        assert!(net.bandwidth(NodeId(0), NodeId(1)).is_none());
+
+        // With the cap cleared, send_sized should behave like send.
+        net.send_sized(NodeId(0), NodeId(1), 0, 1_000_000);
+        let stats = net.run(|_ctx, _event| {});
+        assert_eq!(stats.messages_delivered, 1);
+        assert_eq!(stats.final_time, Time::ZERO);
+    }
+
+    #[test]
+    fn bandwidth_is_directional() {
+        // Cap A->B but leave B->A uncapped.
+        let topo = TopologyBuilder::new(2)
+            .link(0u32, 1u32, Duration::from_millis(0))
+            .build();
+
+        let mut net: Network<u32> = Network::new(topo, 42);
+        net.set_bandwidth(NodeId(0), NodeId(1), 1_000_000); // 1 MB/s forward
+
+        net.send_sized(NodeId(0), NodeId(1), 0, 1_000_000); // 1s tx
+        net.send_sized(NodeId(1), NodeId(0), 1, 1_000_000); // no cap, 0s tx
+
+        let mut arrivals = Vec::new();
+        net.run(|ctx, event| {
+            if let NetEvent::Deliver(msg) = event {
+                arrivals.push((msg.payload, ctx.now()));
+            }
+        });
+
+        arrivals.sort_by_key(|(p, _)| *p);
+        assert_eq!(arrivals[0], (0, Time::from_secs(1)));
+        assert_eq!(arrivals[1], (1, Time::ZERO));
     }
 
     #[test]
