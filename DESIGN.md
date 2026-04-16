@@ -403,8 +403,10 @@ If that works deterministically, the nucleus of the project is sound.
 ### Phase 7: advanced models
 
 - loss/failure injection (in-progress: partition/heal, `SpikyLatency` landed in 2026-04)
-- minimal `LinkCapacity` / end-to-end bandwidth cap (deferred; needs per-link queueing + message-size model)
-- full queueing and contention
+- minimal end-to-end bandwidth cap with per-`(src, dst)` serialization
+  queueing landed in 2026-04 via `Network::set_bandwidth` + `send_sized`
+- full queueing and contention (per-link capacity along multi-hop paths,
+  not just per-pair; still TODO)
 - partitioning experiments
 
 ## README draft
