@@ -126,6 +126,33 @@ impl<E> EventQueue<E> {
     pub fn total_scheduled(&self) -> u64 {
         self.next_sequence
     }
+
+    /// Drains the queue, applies a transform to every scheduled event, and
+    /// rebuilds the heap from what the closure returns.
+    ///
+    /// For each scheduled event, the closure receives the original
+    /// `Scheduled<E>` (consumed) and returns:
+    ///
+    /// * `None` — the event is dropped from the queue.
+    /// * `Some((time, event))` — the event is reinserted at `time` with a
+    ///   freshly-allocated sequence number. Using a fresh sequence preserves
+    ///   the invariant that "an event reinserted at the moment of rewrite
+    ///   sorts after any event already scheduled at that time."
+    ///
+    /// `total_scheduled()` reflects every reinsertion as a new schedule.
+    /// Used by the network layer to rewrite in-flight `Deliver` events into
+    /// `Drop` events when a failure is injected mid-run.
+    pub fn rewrite<F>(&mut self, mut f: F)
+    where
+        F: FnMut(Scheduled<E>) -> Option<(Time, E)>,
+    {
+        let drained: Vec<_> = self.heap.drain().collect();
+        for s in drained {
+            if let Some((time, event)) = f(s) {
+                self.schedule(time, event);
+            }
+        }
+    }
 }
 
 impl<E> Default for EventQueue<E> {
@@ -193,6 +220,46 @@ mod tests {
         assert_eq!(queue.len(), 1);
         assert_eq!(queue.pop().unwrap().event, TestEvent(1));
         assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn rewrite_filters_and_replaces_events() {
+        let mut queue = EventQueue::new();
+        queue.schedule(Time::from_millis(10), TestEvent(1));
+        queue.schedule(Time::from_millis(20), TestEvent(2));
+        queue.schedule(Time::from_millis(30), TestEvent(3));
+
+        // Drop event 2; move event 3 to time 5 (before original event 1).
+        queue.rewrite(|s| match s.event.0 {
+            2 => None,
+            3 => Some((Time::from_millis(5), TestEvent(99))),
+            _ => Some((s.time, s.event)),
+        });
+
+        // Expected order: TestEvent(99) at 5ms, TestEvent(1) at 10ms.
+        let drained: Vec<_> = std::iter::from_fn(|| queue.pop())
+            .map(|s| (s.time, s.event.0))
+            .collect();
+        assert_eq!(
+            drained,
+            vec![(Time::from_millis(5), 99), (Time::from_millis(10), 1)]
+        );
+    }
+
+    #[test]
+    fn rewrite_assigns_fresh_sequence_numbers() {
+        // Reinserting two events at the same time inside `rewrite` must
+        // give them new monotonic seqs, preserving FIFO at that timestamp.
+        let mut queue = EventQueue::new();
+        queue.schedule(Time::from_millis(100), TestEvent(1));
+        queue.schedule(Time::from_millis(200), TestEvent(2));
+
+        // Rewrite both to the same time. Order should follow the order
+        // the closure visits them, which is heap pop order (1 first).
+        queue.rewrite(|s| Some((Time::from_millis(50), s.event)));
+
+        assert_eq!(queue.pop().unwrap().event.0, 1);
+        assert_eq!(queue.pop().unwrap().event.0, 2);
     }
 
     #[test]

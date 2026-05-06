@@ -409,12 +409,14 @@ If that works deterministically, the nucleus of the project is sound.
     Dijkstra-aware) landed in 2026-05; in-flight messages survive
   - node failure (`Topology::fail_node` / `heal_node`) landed in 2026-05;
     excludes the node from routing as src, dst, or intermediate hop
+  - opt-in in-flight drop landed in 2026-05 via
+    `NetConfig::drop_in_flight_on_failure`; failure mutators sweep the
+    event queue and rewrite unroutable `Deliver` events into `Drop`s
+    (uses new `Simulation::rewrite_queue` API)
 - minimal end-to-end bandwidth cap with per-`(src, dst)` serialization
   queueing landed in 2026-04 via `Network::set_bandwidth` + `send_sized`
 - full queueing and contention (per-link capacity along multi-hop paths,
   not just per-pair; still TODO)
-- in-flight drop on partition/link-failure/node-failure (currently survives;
-  would need event-queue surgery)
 - partitioning experiments
 
 ## README draft

@@ -2,7 +2,9 @@
 //!
 //! Provides helpers for recording traces of network simulations.
 
-use crate::net::{DropReason, LatencyModel, NetEvent, Network, NetworkStats, NodeId, Topology};
+use crate::net::{
+    DropReason, LatencyModel, NetConfig, NetEvent, Network, NetworkStats, NodeId, Topology,
+};
 use crate::time::Time;
 use crate::trace::{Trace, TraceRecorder};
 
@@ -83,6 +85,12 @@ impl<P, L: LatencyModel> TracedNetwork<P, L> {
             network: Network::with_latency_model(topology, latency_model, seed),
             seed,
         }
+    }
+
+    /// Replaces the network's [`NetConfig`]. See [`Network::with_config`].
+    pub fn with_config(mut self, config: NetConfig) -> Self {
+        self.network = self.network.with_config(config);
+        self
     }
 
     /// Installs a partition between `a` and `b`. See [`Network::partition`].

@@ -138,11 +138,21 @@ pub enum DropReason {
 pub struct NetConfig {
     /// Probability of packet loss (0.0 to 1.0).
     pub packet_loss: f64,
+    /// When `true`, calls to [`Network::partition`], [`Network::fail_link`],
+    /// [`Network::fail_node`] (and their `RunContext` equivalents) walk the
+    /// pending event queue and rewrite any in-flight `Deliver` events
+    /// whose `(src, dst)` no longer routes — replacing them with `Drop`
+    /// events at the time of the failure call. Defaults to `false`,
+    /// matching the historic "in-flight messages survive" semantics.
+    pub drop_in_flight_on_failure: bool,
 }
 
 impl Default for NetConfig {
     fn default() -> Self {
-        NetConfig { packet_loss: 0.0 }
+        NetConfig {
+            packet_loss: 0.0,
+            drop_in_flight_on_failure: false,
+        }
     }
 }
 
@@ -204,6 +214,48 @@ fn transmission_duration(bps: u64, size_bytes: u64) -> Duration {
     let numerator = size_bytes.saturating_mul(1_000_000_000);
     let nanos = numerator.div_ceil(bps);
     Duration::from_nanos(nanos)
+}
+
+/// Walks all pending `Deliver` events on `sim` and rewrites any whose
+/// `(src, dst)` no longer routes against the current topology + partitions
+/// into `Drop` events firing at `now`. `Drop` events already in the queue
+/// and other event payloads are left untouched.
+///
+/// This is the in-flight-drop sweep invoked from a failure mutator
+/// (`partition`, `fail_link`, `fail_node`, etc.) when the
+/// [`NetConfig::drop_in_flight_on_failure`] flag is set. Without the
+/// flag, in-flight messages keep their original delivery time, matching
+/// the historic semantics.
+fn sweep_failure_drops<P>(
+    sim: &mut Simulation<NetEvent<P>>,
+    topology: &mut Topology,
+    partitions: &std::collections::HashSet<(NodeId, NodeId)>,
+    now: Time,
+) {
+    sim.rewrite_queue(|s| match s.event {
+        NetEvent::Deliver(msg) => {
+            if partitions.contains(&partition_key(msg.src, msg.dst)) {
+                Some((
+                    now,
+                    NetEvent::Drop {
+                        message: msg,
+                        reason: DropReason::Partitioned,
+                    },
+                ))
+            } else if topology.route(msg.src, msg.dst).is_none() {
+                Some((
+                    now,
+                    NetEvent::Drop {
+                        message: msg,
+                        reason: DropReason::NoRoute,
+                    },
+                ))
+            } else {
+                Some((s.time, NetEvent::Deliver(msg)))
+            }
+        }
+        other => Some((s.time, other)),
+    });
 }
 
 fn partition_key(a: NodeId, b: NodeId) -> (NodeId, NodeId) {
@@ -424,13 +476,28 @@ impl<P, L: LatencyModel> Network<P, L> {
     /// dropped with [`DropReason::Partitioned`] until [`Network::heal`] is
     /// called. Partitioning is done at the `(src, dst)` pair granularity;
     /// messages routed between other node pairs are unaffected.
+    ///
+    /// Pending `Deliver` events already on the queue are unaffected by
+    /// default. To also drop in-flight messages whose route is now broken,
+    /// set [`NetConfig::drop_in_flight_on_failure`] before calling.
     pub fn partition(&mut self, a: NodeId, b: NodeId) {
         self.partitions.insert(partition_key(a, b));
+        self.maybe_sweep_in_flight();
     }
 
     /// Removes a previously installed partition between `a` and `b`.
     pub fn heal(&mut self, a: NodeId, b: NodeId) {
         self.partitions.remove(&partition_key(a, b));
+    }
+
+    /// If the config opts in, walks the queue and converts now-unroutable
+    /// `Deliver` events into `Drop` events at the current simulated time.
+    /// No-op when the flag is off.
+    fn maybe_sweep_in_flight(&mut self) {
+        if self.config.drop_in_flight_on_failure {
+            let now = self.sim.now();
+            sweep_failure_drops(&mut self.sim, &mut self.topology, &self.partitions, now);
+        }
     }
 
     /// Returns `true` if `a` and `b` are currently partitioned.
@@ -443,10 +510,12 @@ impl<P, L: LatencyModel> Network<P, L> {
     /// so sends whose shortest path required this link will either reroute
     /// around it or drop with [`DropReason::NoRoute`].
     ///
-    /// In-flight messages already scheduled for delivery are not affected.
-    /// For an asymmetric failure, use [`Network::fail_link_directed`].
+    /// Pending `Deliver` events already on the queue are unaffected by
+    /// default; set [`NetConfig::drop_in_flight_on_failure`] to also drop
+    /// them. For an asymmetric failure, use [`Network::fail_link_directed`].
     pub fn fail_link(&mut self, a: NodeId, b: NodeId) {
         self.topology.fail_link(a, b);
+        self.maybe_sweep_in_flight();
     }
 
     /// Restores a previously-failed bidirectional link between `a` and `b`.
@@ -463,6 +532,7 @@ impl<P, L: LatencyModel> Network<P, L> {
     /// Fails a single direction of the link between `src` and `dst`.
     pub fn fail_link_directed(&mut self, src: NodeId, dst: NodeId) {
         self.topology.fail_link_directed(src, dst);
+        self.maybe_sweep_in_flight();
     }
 
     /// Restores a single direction of the link between `src` and `dst`.
@@ -478,9 +548,13 @@ impl<P, L: LatencyModel> Network<P, L> {
     /// Marks `node` as failed at the topology level. All routes whose
     /// source, destination, or any intermediate hop is failed will return
     /// no route, dropping affected sends with [`DropReason::NoRoute`].
-    /// In-flight messages already scheduled for delivery are not affected.
+    ///
+    /// Pending `Deliver` events already on the queue are unaffected by
+    /// default; set [`NetConfig::drop_in_flight_on_failure`] to also drop
+    /// them.
     pub fn fail_node(&mut self, node: NodeId) {
         self.topology.fail_node(node);
+        self.maybe_sweep_in_flight();
     }
 
     /// Restores a previously-failed node.
@@ -733,6 +807,7 @@ impl<P, L: LatencyModel> Network<P, L> {
             delivered: 0,
             dropped: 0,
             pending_sends: Vec::new(),
+            needs_failure_sweep: false,
         };
 
         let mut handler = handler;
@@ -748,6 +823,20 @@ impl<P, L: LatencyModel> Network<P, L> {
             }
 
             handler(&mut ctx, event);
+
+            // If the handler called fail_link / fail_node / partition and
+            // the config opted in, rewrite the queue *before* draining
+            // pending sends so any newly-scheduled sends from this handler
+            // route against the post-failure topology fresh.
+            if ctx.needs_failure_sweep && ctx.config.drop_in_flight_on_failure {
+                ctx.needs_failure_sweep = false;
+                let now = sim.now();
+                sweep_failure_drops(sim, &mut ctx.topology, &ctx.partitions, now);
+            } else {
+                // Reset unconditionally so the flag never accumulates between
+                // events when the config is off.
+                ctx.needs_failure_sweep = false;
+            }
 
             // Process pending sends after handler completes
             for (src, dst, payload, size_bytes) in ctx.pending_sends.drain(..) {
@@ -863,6 +952,11 @@ pub struct RunContext<P, L: LatencyModel> {
     delivered: u64,
     dropped: u64,
     pending_sends: Vec<(NodeId, NodeId, P, u64)>,
+    /// Set by mid-run failure mutators (`partition`, `fail_link`,
+    /// `fail_node`, ...) to request that the run loop sweep the event
+    /// queue once the handler returns. Combined with
+    /// [`NetConfig::drop_in_flight_on_failure`].
+    needs_failure_sweep: bool,
 }
 
 impl<P, L: LatencyModel> RunContext<P, L> {
@@ -910,9 +1004,14 @@ impl<P, L: LatencyModel> RunContext<P, L> {
     /// Installs a partition between `a` and `b` in-flight.
     ///
     /// Subsequent sends across this pair will drop with
-    /// [`DropReason::Partitioned`].
+    /// [`DropReason::Partitioned`]. If
+    /// [`NetConfig::drop_in_flight_on_failure`] is enabled, pending
+    /// `Deliver` events whose `(src, dst)` matches the partition are
+    /// rewritten into `Drop` events at the current simulated time, after
+    /// the current handler returns.
     pub fn partition(&mut self, a: NodeId, b: NodeId) {
         self.partitions.insert(partition_key(a, b));
+        self.needs_failure_sweep = true;
     }
 
     /// Heals a previously installed in-flight partition.
@@ -929,6 +1028,7 @@ impl<P, L: LatencyModel> RunContext<P, L> {
     /// [`Network::fail_link`] for semantics.
     pub fn fail_link(&mut self, a: NodeId, b: NodeId) {
         self.topology.fail_link(a, b);
+        self.needs_failure_sweep = true;
     }
 
     /// Restores a previously-failed bidirectional link between `a` and `b`.
@@ -945,6 +1045,7 @@ impl<P, L: LatencyModel> RunContext<P, L> {
     /// Fails a single direction of the link between `src` and `dst`.
     pub fn fail_link_directed(&mut self, src: NodeId, dst: NodeId) {
         self.topology.fail_link_directed(src, dst);
+        self.needs_failure_sweep = true;
     }
 
     /// Restores a single direction of the link between `src` and `dst`.
@@ -960,6 +1061,7 @@ impl<P, L: LatencyModel> RunContext<P, L> {
     /// Marks `node` as failed mid-run. See [`Network::fail_node`].
     pub fn fail_node(&mut self, node: NodeId) {
         self.topology.fail_node(node);
+        self.needs_failure_sweep = true;
     }
 
     /// Restores a previously-failed node.
@@ -1082,7 +1184,10 @@ mod tests {
             .link(0u32, 1u32, Duration::from_millis(10))
             .build();
 
-        let config = NetConfig { packet_loss: 0.5 };
+        let config = NetConfig {
+            packet_loss: 0.5,
+            ..Default::default()
+        };
         let mut net = Network::new(topo, 42).with_config(config);
 
         // Send many messages
@@ -1997,6 +2102,162 @@ mod tests {
         assert_eq!(hops_taken[0], (1, Time::from_millis(10)));
         assert_eq!(hops_taken[1], (2, Time::from_millis(300)));
         assert_eq!(hops_taken[2], (3, Time::from_millis(410)));
+    }
+
+    fn drop_in_flight_config() -> NetConfig {
+        NetConfig {
+            drop_in_flight_on_failure: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn drop_in_flight_default_off_preserves_in_flight_messages() {
+        // Without the opt-in flag, an in-flight message that is later
+        // partitioned away must still deliver — this is the historic
+        // behavior that existing tests depend on.
+        let topo = TopologyBuilder::new(2)
+            .link(0u32, 1u32, Duration::from_millis(10))
+            .build();
+
+        let mut net = Network::new(topo, 42);
+        net.send(NodeId(0), NodeId(1), "in_flight");
+        // Partition installed *after* the send; default config keeps the
+        // already-scheduled Deliver event intact.
+        net.partition(NodeId(0), NodeId(1));
+
+        let stats = net.run(|_ctx, _event| {});
+        assert_eq!(stats.messages_delivered, 1);
+        assert_eq!(stats.messages_dropped, 0);
+    }
+
+    #[test]
+    fn drop_in_flight_partition_rewrites_pending_delivery() {
+        // With the flag on, partitioning after the send must rewrite the
+        // queued Deliver event into a Drop with reason Partitioned, fired
+        // at the time of the partition call (now == 0 here).
+        let topo = TopologyBuilder::new(2)
+            .link(0u32, 1u32, Duration::from_millis(10))
+            .build();
+
+        let mut net = Network::new(topo, 42).with_config(drop_in_flight_config());
+        net.send(NodeId(0), NodeId(1), "in_flight");
+        net.partition(NodeId(0), NodeId(1));
+
+        let mut dropped = Vec::new();
+        let stats = net.run(|ctx, event| {
+            if let NetEvent::Drop { message, reason } = event {
+                dropped.push((message.payload, reason, ctx.now()));
+            }
+        });
+
+        assert_eq!(stats.messages_delivered, 0);
+        assert_eq!(stats.messages_dropped, 1);
+        assert_eq!(
+            dropped,
+            vec![("in_flight", DropReason::Partitioned, Time::ZERO)]
+        );
+    }
+
+    #[test]
+    fn drop_in_flight_link_failure_drops_when_no_alternate() {
+        let topo = TopologyBuilder::new(3)
+            .link(0u32, 1u32, Duration::from_millis(10))
+            .link(1u32, 2u32, Duration::from_millis(10))
+            .build();
+
+        let mut net = Network::new(topo, 42).with_config(drop_in_flight_config());
+        net.send(NodeId(0), NodeId(2), "doomed");
+        net.fail_link(NodeId(0), NodeId(1));
+
+        let mut dropped = Vec::new();
+        let stats = net.run(|_ctx, event| {
+            if let NetEvent::Drop { message, reason } = event {
+                dropped.push((message.payload, reason));
+            }
+        });
+
+        assert_eq!(stats.messages_delivered, 0);
+        assert_eq!(dropped, vec![("doomed", DropReason::NoRoute)]);
+    }
+
+    #[test]
+    fn drop_in_flight_link_failure_preserves_when_alternate_exists() {
+        // Triangle: failing 0-1 still leaves 0->2 directly via the slow edge.
+        // The in-flight 0->2 message (originally taking the fast 0-1-2 path)
+        // is still routable, so the sweep must leave it alone.
+        let topo = TopologyBuilder::new(3)
+            .link(0u32, 1u32, Duration::from_millis(10))
+            .link(1u32, 2u32, Duration::from_millis(10))
+            .link(0u32, 2u32, Duration::from_millis(100))
+            .build();
+
+        let mut net = Network::new(topo, 42).with_config(drop_in_flight_config());
+        net.send(NodeId(0), NodeId(2), "still_ok");
+        net.fail_link(NodeId(0), NodeId(1));
+
+        let stats = net.run(|_ctx, _event| {});
+        assert_eq!(stats.messages_delivered, 1);
+        assert_eq!(stats.messages_dropped, 0);
+    }
+
+    #[test]
+    fn drop_in_flight_node_failure_drops_when_node_is_dst() {
+        let topo = TopologyBuilder::new(2)
+            .link(0u32, 1u32, Duration::from_millis(10))
+            .build();
+
+        let mut net = Network::new(topo, 42).with_config(drop_in_flight_config());
+        net.send(NodeId(0), NodeId(1), "to_dead");
+        net.fail_node(NodeId(1));
+
+        let mut dropped = Vec::new();
+        let stats = net.run(|_ctx, event| {
+            if let NetEvent::Drop { message, reason } = event {
+                dropped.push((message.payload, reason));
+            }
+        });
+
+        assert_eq!(stats.messages_delivered, 0);
+        assert_eq!(dropped, vec![("to_dead", DropReason::NoRoute)]);
+    }
+
+    #[test]
+    fn drop_in_flight_works_mid_run_via_run_context() {
+        // Send a message at t=0 (delivers at t=10ms). At t=5ms, a self-tick
+        // causes the handler to fail the link. The sweep on the post-handler
+        // hook must rewrite the in-flight message into a Drop.
+        let topo = TopologyBuilder::new(2)
+            .link(0u32, 1u32, Duration::from_millis(10))
+            .build();
+
+        let mut net: Network<&'static str> =
+            Network::new(topo, 42).with_config(drop_in_flight_config());
+        net.send(NodeId(0), NodeId(1), "doomed");
+        net.send_at(Time::from_millis(5), NodeId(1), NodeId(1), "tick");
+
+        let mut events_seen = Vec::new();
+        net.run(|ctx, event| match event {
+            NetEvent::Deliver(msg) if msg.payload == "tick" => {
+                ctx.fail_link(NodeId(0), NodeId(1));
+                events_seen.push(("tick_at", ctx.now()));
+            }
+            NetEvent::Drop { message, reason } => {
+                events_seen.push((message.payload, ctx.now()));
+                assert_eq!(reason, DropReason::NoRoute);
+            }
+            _ => {}
+        });
+
+        // Tick fired at 5ms; doomed message dropped at 5ms (time of failure),
+        // not at its original 10ms delivery time.
+        assert_eq!(
+            events_seen,
+            vec![
+                ("tick_at", Time::from_millis(5)),
+                ("doomed", Time::from_millis(5))
+            ]
+        );
     }
 
     #[test]

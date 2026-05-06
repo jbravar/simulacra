@@ -118,6 +118,20 @@ impl<E> Simulation<E> {
         self.queue.schedule(self.now + delay, event)
     }
 
+    /// Drains the event queue, applies a transform to every pending event,
+    /// and rebuilds the queue from the closure's results. See
+    /// [`EventQueue::rewrite`] for the closure contract.
+    ///
+    /// Used by higher layers (e.g., the network) to drop or rewrite
+    /// in-flight events when external state changes between schedule time
+    /// and delivery time.
+    pub fn rewrite_queue<F>(&mut self, f: F)
+    where
+        F: FnMut(Scheduled<E>) -> Option<(Time, E)>,
+    {
+        self.queue.rewrite(f);
+    }
+
     /// Returns a reference to the next scheduled event without processing it.
     #[inline]
     pub fn peek(&self) -> Option<&Scheduled<E>> {

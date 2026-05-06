@@ -22,11 +22,10 @@ fn run_scenario(seed: u64) -> String {
     let latency_model = UniformJitter::new(Duration::from_millis(3));
     let mut net = TracedNetwork::<u64, _>::with_latency_model(topology, latency_model, seed);
 
-    // Apply packet loss via the underlying network's config.
-    // Note: TracedNetwork currently doesn't re-export with_config, so we rely
-    // on jitter alone here. Loss-sensitive determinism is covered elsewhere;
-    // this scenario stresses jitter ordering + cross-traffic scheduling.
-    let _ = NetConfig { packet_loss: 0.0 };
+    // This scenario stresses jitter ordering + cross-traffic scheduling.
+    // Loss-sensitive determinism is covered elsewhere; we leave packet_loss
+    // at its default to keep the trace shape simple.
+    let _ = NetConfig::default();
 
     // Cross-traffic: every node sends to the node two hops ahead.
     for i in 0..node_count as u32 {
@@ -233,6 +232,68 @@ fn link_failure_scenario_includes_reroute_and_noroute() {
         "expected at least 3 deliveries (ticks + at least one app message); \
          got {delivered}"
     );
+}
+
+/// In-flight drop scenario. With the opt-in `drop_in_flight_on_failure`
+/// flag, partitioning a pair mid-run rewrites already-scheduled `Deliver`
+/// events into `Drop` events at the time of the partition. The scenario
+/// exercises the rewrite path end-to-end through `TracedNetwork`.
+fn run_drop_in_flight_scenario(seed: u64) -> String {
+    use simulacra::NetConfig;
+
+    let topology = TopologyBuilder::new(3)
+        .link(0u32, 1u32, Duration::from_millis(50))
+        .link(1u32, 2u32, Duration::from_millis(50))
+        .build();
+
+    let latency_model = UniformJitter::new(Duration::from_millis(2));
+    let mut net = TracedNetwork::<u64, _>::with_latency_model(topology, latency_model, seed)
+        .with_config(NetConfig {
+            drop_in_flight_on_failure: true,
+            ..Default::default()
+        });
+
+    // Five 0->2 sends staggered slightly. Each takes ~100ms (50+50) plus
+    // jitter. A self-tick at t=20ms triggers the partition before any of
+    // them deliver, so all five must end up as Drops at t=20ms.
+    for i in 0..5u64 {
+        let _ = net.send_at(simulacra::Time::from_millis(i), NodeId(0), NodeId(2), i);
+    }
+    let _ = net.send_at(simulacra::Time::from_millis(20), NodeId(0), NodeId(0), 999);
+
+    let (_stats, trace) = net.run_traced(|ctx, event| {
+        if let NetEvent::Deliver(msg) = event
+            && msg.payload == 999
+        {
+            ctx.partition(NodeId(0), NodeId(2));
+        }
+    });
+
+    trace
+        .to_json()
+        .expect("trace should serialize to JSON cleanly")
+}
+
+#[test]
+fn drop_in_flight_scenario_is_byte_equal_across_runs() {
+    let a = run_drop_in_flight_scenario(0xFEED);
+    let b = run_drop_in_flight_scenario(0xFEED);
+    assert_eq!(
+        a, b,
+        "two runs with the same seed and partition sequence produced \
+         different JSON traces"
+    );
+}
+
+#[test]
+fn drop_in_flight_scenario_actually_drops_messages() {
+    // Sanity check: confirm the rewrite path is wired up in TracedNetwork.
+    // 5 sends at t={0..5}ms heading to node 2; partition at t=20ms.
+    // Expected: 5 Partitioned drops + 1 self-tick delivered = 5 drops + 1
+    // delivery in the trace.
+    let trace = run_drop_in_flight_scenario(0xFEED);
+    assert_eq!(trace.matches("\"Partitioned\"").count(), 5);
+    assert_eq!(trace.matches("\"Delivered\"").count(), 1);
 }
 
 /// Coarse shape check on the emitted trace.
