@@ -29,7 +29,7 @@
 //! The simulation advances by processing events, which wake tasks as needed.
 
 use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
@@ -38,6 +38,16 @@ use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use crate::net::{NodeId, Topology};
 use crate::queue::EventQueue;
 use crate::time::{Duration, Time};
+
+/// Canonical ordering for an unordered node pair, used as the key for
+/// symmetric partition tracking. Mirrors the helper used in `net::mod`.
+fn pair_key(a: NodeId, b: NodeId) -> (NodeId, NodeId) {
+    if a.as_u32() <= b.as_u32() {
+        (a, b)
+    } else {
+        (b, a)
+    }
+}
 
 /// Unique identifier for a task.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -96,6 +106,13 @@ struct SimState<M> {
     ready_tasks: Vec<TaskId>,
     /// Shutdown flag, shared with all `NodeContext`s via `CancellationToken`.
     cancelled: Rc<Cell<bool>>,
+    /// Active symmetric partitions between node pairs. Sends across a
+    /// partitioned pair drop silently (no inbox push), but increment the
+    /// run's `messages_dropped` counter.
+    partitions: HashSet<(NodeId, NodeId)>,
+    /// Running count of messages that were dropped (no route or
+    /// partition) instead of delivered.
+    messages_dropped: u64,
 }
 
 impl<M> SimState<M> {
@@ -162,6 +179,82 @@ impl<M: 'static> NodeContext<M> {
         CancellationToken {
             flag: Rc::clone(&self.state.borrow().cancelled),
         }
+    }
+
+    /// Installs a symmetric partition between `a` and `b`. Subsequent
+    /// `send` calls across this pair (in either direction) will be dropped
+    /// silently, with the run's `messages_dropped` counter incremented.
+    /// In-flight messages already scheduled for delivery are not affected.
+    pub fn partition(&self, a: NodeId, b: NodeId) {
+        self.state.borrow_mut().partitions.insert(pair_key(a, b));
+    }
+
+    /// Removes a previously-installed partition between `a` and `b`.
+    pub fn heal(&self, a: NodeId, b: NodeId) {
+        self.state.borrow_mut().partitions.remove(&pair_key(a, b));
+    }
+
+    /// Returns `true` if `a` and `b` are currently partitioned.
+    pub fn is_partitioned(&self, a: NodeId, b: NodeId) -> bool {
+        self.state.borrow().partitions.contains(&pair_key(a, b))
+    }
+
+    /// Fails the bidirectional link between `a` and `b` at the topology
+    /// level. Sends whose route required this link will reroute (if an
+    /// alternative exists) or drop. In-flight messages already scheduled
+    /// for delivery are not affected.
+    pub fn fail_link(&self, a: NodeId, b: NodeId) {
+        self.state.borrow_mut().topology.fail_link(a, b);
+    }
+
+    /// Restores a previously-failed bidirectional link between `a` and `b`.
+    pub fn heal_link(&self, a: NodeId, b: NodeId) {
+        self.state.borrow_mut().topology.heal_link(a, b);
+    }
+
+    /// Returns `true` if both directions of the link between `a` and `b`
+    /// are currently failed.
+    pub fn is_link_failed(&self, a: NodeId, b: NodeId) -> bool {
+        self.state.borrow().topology.is_link_failed(a, b)
+    }
+
+    /// Fails a single direction of the link between `src` and `dst`.
+    pub fn fail_link_directed(&self, src: NodeId, dst: NodeId) {
+        self.state
+            .borrow_mut()
+            .topology
+            .fail_link_directed(src, dst);
+    }
+
+    /// Restores a single direction of the link between `src` and `dst`.
+    pub fn heal_link_directed(&self, src: NodeId, dst: NodeId) {
+        self.state
+            .borrow_mut()
+            .topology
+            .heal_link_directed(src, dst);
+    }
+
+    /// Returns `true` if the directed edge `src -> dst` is failed.
+    pub fn is_link_failed_directed(&self, src: NodeId, dst: NodeId) -> bool {
+        self.state
+            .borrow()
+            .topology
+            .is_link_failed_directed(src, dst)
+    }
+
+    /// Marks `node` as failed; routing excludes it as src, dst, or hop.
+    pub fn fail_node(&self, node: NodeId) {
+        self.state.borrow_mut().topology.fail_node(node);
+    }
+
+    /// Restores a previously-failed node.
+    pub fn heal_node(&self, node: NodeId) {
+        self.state.borrow_mut().topology.heal_node(node);
+    }
+
+    /// Returns `true` if `node` is currently marked as failed.
+    pub fn is_node_failed(&self, node: NodeId) -> bool {
+        self.state.borrow().topology.is_node_failed(node)
     }
 
     /// Sleeps for the specified duration of simulated time.
@@ -337,14 +430,23 @@ impl<M: Clone + 'static> Future for SendFut<M> {
             let mut state = this.state.borrow_mut();
             let now = state.now;
 
-            // Compute delivery time using topology
-            let delivery_time = if let Some(route) = state.topology.route(this.src, this.dst) {
-                now + route.total_latency
-            } else {
-                // No route - deliver immediately (or could drop)
-                now
+            // Drop sends that cross an active partition or have no route.
+            // The send-future still completes cleanly — the message just
+            // never lands in the destination's inbox. Stats track the drop.
+            if state.partitions.contains(&pair_key(this.src, this.dst)) {
+                state.messages_dropped += 1;
+                return Poll::Ready(());
+            }
+
+            let route = match state.topology.route(this.src, this.dst) {
+                Some(r) => r,
+                None => {
+                    state.messages_dropped += 1;
+                    return Poll::Ready(());
+                }
             };
 
+            let delivery_time = now + route.total_latency;
             state.events.schedule(
                 delivery_time,
                 TaskEvent::Deliver {
@@ -477,6 +579,8 @@ impl<M: 'static> TaskSimBuilder<M> {
             events: EventQueue::new(),
             ready_tasks: Vec::new(),
             cancelled: Rc::new(Cell::new(false)),
+            partitions: HashSet::new(),
+            messages_dropped: 0,
         }));
 
         // Create tasks for each node
@@ -528,6 +632,11 @@ pub struct TaskSimStats {
     pub task_polls: u64,
     /// Number of tasks that returned `Poll::Ready` during the run.
     pub tasks_completed: u64,
+    /// Messages that were dropped instead of delivered, counted from
+    /// `inject` and `NodeContext::send` calls hitting an active partition,
+    /// failed link, or failed node. Drops are silent — the destination's
+    /// inbox is not modified — so callers learn about them via this stat.
+    pub messages_dropped: u64,
 }
 
 /// A task-based simulation.
@@ -545,17 +654,28 @@ pub struct TaskSim<M: 'static> {
 impl<M: Clone + 'static> TaskSim<M> {
     /// Injects a message into the simulation.
     ///
-    /// The message will be delivered after network latency.
+    /// The message will be delivered after network latency. If the
+    /// destination is unreachable from the source (no route, partitioned,
+    /// failed link/node), the injection is dropped and the run's
+    /// `messages_dropped` counter increments.
     pub fn inject(&mut self, src: NodeId, dst: NodeId, payload: M) {
         let mut state = self.state.borrow_mut();
         let now = state.now;
 
-        let delivery_time = if let Some(route) = state.topology.route(src, dst) {
-            now + route.total_latency
-        } else {
-            now
+        if state.partitions.contains(&pair_key(src, dst)) {
+            state.messages_dropped += 1;
+            return;
+        }
+
+        let route = match state.topology.route(src, dst) {
+            Some(r) => r,
+            None => {
+                state.messages_dropped += 1;
+                return;
+            }
         };
 
+        let delivery_time = now + route.total_latency;
         state.events.schedule(
             delivery_time,
             TaskEvent::Deliver {
@@ -570,6 +690,77 @@ impl<M: Clone + 'static> TaskSim<M> {
     /// Returns the seed used for this simulation.
     pub fn seed(&self) -> u64 {
         self.seed
+    }
+
+    /// Installs a symmetric partition between `a` and `b`. See
+    /// [`NodeContext::partition`].
+    pub fn partition(&mut self, a: NodeId, b: NodeId) {
+        self.state.borrow_mut().partitions.insert(pair_key(a, b));
+    }
+
+    /// Removes a previously-installed partition.
+    pub fn heal(&mut self, a: NodeId, b: NodeId) {
+        self.state.borrow_mut().partitions.remove(&pair_key(a, b));
+    }
+
+    /// Returns `true` if `a` and `b` are currently partitioned.
+    pub fn is_partitioned(&self, a: NodeId, b: NodeId) -> bool {
+        self.state.borrow().partitions.contains(&pair_key(a, b))
+    }
+
+    /// Fails the bidirectional link between `a` and `b`.
+    pub fn fail_link(&mut self, a: NodeId, b: NodeId) {
+        self.state.borrow_mut().topology.fail_link(a, b);
+    }
+
+    /// Restores a previously-failed bidirectional link.
+    pub fn heal_link(&mut self, a: NodeId, b: NodeId) {
+        self.state.borrow_mut().topology.heal_link(a, b);
+    }
+
+    /// Returns `true` if both directions of the link between `a` and `b`
+    /// are currently failed.
+    pub fn is_link_failed(&self, a: NodeId, b: NodeId) -> bool {
+        self.state.borrow().topology.is_link_failed(a, b)
+    }
+
+    /// Fails a single direction of the link between `src` and `dst`.
+    pub fn fail_link_directed(&mut self, src: NodeId, dst: NodeId) {
+        self.state
+            .borrow_mut()
+            .topology
+            .fail_link_directed(src, dst);
+    }
+
+    /// Restores a single direction of the link between `src` and `dst`.
+    pub fn heal_link_directed(&mut self, src: NodeId, dst: NodeId) {
+        self.state
+            .borrow_mut()
+            .topology
+            .heal_link_directed(src, dst);
+    }
+
+    /// Returns `true` if the directed edge `src -> dst` is failed.
+    pub fn is_link_failed_directed(&self, src: NodeId, dst: NodeId) -> bool {
+        self.state
+            .borrow()
+            .topology
+            .is_link_failed_directed(src, dst)
+    }
+
+    /// Marks `node` as failed.
+    pub fn fail_node(&mut self, node: NodeId) {
+        self.state.borrow_mut().topology.fail_node(node);
+    }
+
+    /// Restores a previously-failed node.
+    pub fn heal_node(&mut self, node: NodeId) {
+        self.state.borrow_mut().topology.heal_node(node);
+    }
+
+    /// Returns `true` if `node` is currently marked as failed.
+    pub fn is_node_failed(&self, node: NodeId) -> bool {
+        self.state.borrow().topology.is_node_failed(node)
     }
 
     /// Returns a cancellation token for this simulation.
@@ -682,7 +873,9 @@ impl<M: Clone + 'static> TaskSim<M> {
             }
         }
 
-        stats.final_time = self.state.borrow().now;
+        let state = self.state.borrow();
+        stats.final_time = state.now;
+        stats.messages_dropped = state.messages_dropped;
         stats
     }
 }
@@ -896,21 +1089,168 @@ mod tests {
     }
 
     #[test]
-    fn no_route_still_delivers() {
-        let topology = TopologyBuilder::new(2).build(); // No links!
+    fn no_route_drops_instead_of_delivering() {
+        // Topology with no links: inject drops the message rather than
+        // silently delivering it. Node 1's task exits via the shutdown
+        // token so the run terminates cleanly.
+        let topology = TopologyBuilder::new(2).build();
 
         let mut sim = TaskSimBuilder::<String>::new(topology, 42).build(|ctx| async move {
             if ctx.id().as_u32() == 1 {
-                let msg = ctx.recv().await;
-                assert_eq!(msg.payload, "unreachable?");
+                // Use a recv-with-timeout to exit when no message arrives.
+                let _ = ctx.recv_timeout(Duration::from_millis(1)).await;
             }
         });
 
         sim.inject(NodeId(0), NodeId(1), "unreachable?".to_string());
 
         let stats = sim.run();
+        assert_eq!(stats.messages_delivered, 0);
+        assert_eq!(stats.messages_dropped, 1);
+    }
+
+    #[test]
+    fn fail_link_pre_run_drops_send() {
+        // 0 -- 1, link failed before any task runs. The send from inside
+        // node 0's task must drop, not deliver.
+        let topology = TopologyBuilder::new(2)
+            .link(0u32, 1u32, Duration::from_millis(10))
+            .build();
+
+        let mut sim = TaskSimBuilder::<&'static str>::new(topology, 42).build(|ctx| async move {
+            if ctx.id() == NodeId(0) {
+                ctx.send(NodeId(1), "blocked").await;
+            } else {
+                let _ = ctx.recv_timeout(Duration::from_millis(1)).await;
+            }
+        });
+
+        sim.fail_link(NodeId(0), NodeId(1));
+        let stats = sim.run();
+        assert_eq!(stats.messages_delivered, 0);
+        assert_eq!(stats.messages_dropped, 1);
+    }
+
+    #[test]
+    fn fail_link_pre_run_reroutes_send() {
+        // Triangle: failing the cheap 0-1 path forces the slow direct edge.
+        let topology = TopologyBuilder::new(3)
+            .link(0u32, 1u32, Duration::from_millis(5))
+            .link(1u32, 2u32, Duration::from_millis(5))
+            .link(0u32, 2u32, Duration::from_millis(50))
+            .build();
+
+        let mut sim = TaskSimBuilder::<&'static str>::new(topology, 42).build(|ctx| async move {
+            if ctx.id() == NodeId(0) {
+                ctx.send(NodeId(2), "long way").await;
+            } else if ctx.id() == NodeId(2) {
+                let msg = ctx.recv().await;
+                assert_eq!(msg.payload, "long way");
+                assert_eq!(msg.received_at, Time::from_millis(50));
+            } else {
+                let _ = ctx.recv_timeout(Duration::from_millis(1)).await;
+            }
+        });
+
+        sim.fail_link(NodeId(0), NodeId(1));
+        let stats = sim.run();
         assert_eq!(stats.messages_delivered, 1);
-        assert_eq!(stats.final_time, Time::ZERO);
+        assert_eq!(stats.messages_dropped, 0);
+    }
+
+    #[test]
+    fn fail_node_pre_run_drops_sends_to_failed_node() {
+        let topology = TopologyBuilder::new(2)
+            .link(0u32, 1u32, Duration::from_millis(10))
+            .build();
+
+        let mut sim = TaskSimBuilder::<&'static str>::new(topology, 42).build(|ctx| async move {
+            if ctx.id() == NodeId(0) {
+                ctx.send(NodeId(1), "to_dead").await;
+            }
+            // Node 1's task still runs but its send won't deliver either way.
+        });
+
+        sim.fail_node(NodeId(1));
+        let stats = sim.run();
+        assert_eq!(stats.messages_delivered, 0);
+        assert_eq!(stats.messages_dropped, 1);
+    }
+
+    #[test]
+    fn partition_drops_sends_in_both_directions() {
+        let topology = TopologyBuilder::new(3)
+            .full_mesh(Duration::from_millis(10))
+            .build();
+
+        let mut sim = TaskSimBuilder::<&'static str>::new(topology, 42).build(|ctx| async move {
+            match ctx.id().as_u32() {
+                0 => {
+                    ctx.send(NodeId(1), "blocked_a").await;
+                    ctx.send(NodeId(2), "still_works").await;
+                }
+                1 => {
+                    ctx.send(NodeId(0), "blocked_b").await;
+                    let _ = ctx.recv_timeout(Duration::from_millis(1)).await;
+                }
+                _ => {
+                    let msg = ctx.recv().await;
+                    assert_eq!(msg.payload, "still_works");
+                }
+            }
+        });
+
+        sim.partition(NodeId(0), NodeId(1));
+        assert!(sim.is_partitioned(NodeId(0), NodeId(1)));
+        let stats = sim.run();
+        // 2 dropped (0->1 and 1->0), 1 delivered (0->2).
+        assert_eq!(stats.messages_dropped, 2);
+        assert_eq!(stats.messages_delivered, 1);
+    }
+
+    #[test]
+    fn node_context_can_fail_and_heal_link_mid_run() {
+        // Triangle topology. Node 0's task: send via fast path, then fail
+        // it, send again (must reroute via slow), then heal, send again
+        // (must deliver via fast). Node 2 records arrival times.
+        let topology = TopologyBuilder::new(3)
+            .link(0u32, 1u32, Duration::from_millis(5))
+            .link(1u32, 2u32, Duration::from_millis(5))
+            .link(0u32, 2u32, Duration::from_millis(50))
+            .build();
+
+        let arrivals: Rc<RefCell<Vec<(u32, Time)>>> = Rc::new(RefCell::new(Vec::new()));
+        let arrivals_for_recv = Rc::clone(&arrivals);
+
+        let sim = TaskSimBuilder::<u32>::new(topology, 42).build(move |ctx| {
+            let arrivals = Rc::clone(&arrivals_for_recv);
+            async move {
+                if ctx.id() == NodeId(0) {
+                    ctx.send(NodeId(2), 1).await;
+                    ctx.sleep(Duration::from_millis(100)).await;
+                    ctx.fail_link(NodeId(0), NodeId(1));
+                    ctx.send(NodeId(2), 2).await;
+                    ctx.sleep(Duration::from_millis(100)).await;
+                    ctx.heal_link(NodeId(0), NodeId(1));
+                    ctx.send(NodeId(2), 3).await;
+                } else if ctx.id() == NodeId(2) {
+                    for _ in 0..3 {
+                        let msg = ctx.recv().await;
+                        arrivals.borrow_mut().push((msg.payload, msg.received_at));
+                    }
+                }
+            }
+        });
+        let _stats = sim.run();
+
+        let arrivals = arrivals.borrow();
+        assert_eq!(arrivals.len(), 3);
+        // First message via 0-1-2 (10ms), arrives at t=10ms.
+        // Second message at t=100ms via direct 0-2 (50ms), arrives at t=150ms.
+        // Third message at t=200ms via 0-1-2 again (10ms), arrives at t=210ms.
+        assert_eq!(arrivals[0], (1, Time::from_millis(10)));
+        assert_eq!(arrivals[1], (2, Time::from_millis(150)));
+        assert_eq!(arrivals[2], (3, Time::from_millis(210)));
     }
 
     #[test]

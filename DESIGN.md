@@ -413,6 +413,12 @@ If that works deterministically, the nucleus of the project is sound.
     `NetConfig::drop_in_flight_on_failure`; failure mutators sweep the
     event queue and rewrite unroutable `Deliver` events into `Drop`s
     (uses new `Simulation::rewrite_queue` API)
+  - failure injection in async task facade landed in 2026-05:
+    `NodeContext` and `TaskSim` expose `partition` / `heal` / `fail_link` /
+    `heal_link` (+ `_directed`) / `fail_node` / `heal_node`; sends across
+    failed/partitioned routes drop with `messages_dropped` counter on
+    `TaskSimStats`. Replaces the previous broken "no route → silent
+    deliver-now" behavior in `SendFut`/`inject` with a clean drop.
 - minimal end-to-end bandwidth cap with per-`(src, dst)` serialization
   queueing landed in 2026-04 via `Network::set_bandwidth` + `send_sized`
 - full queueing and contention (per-link capacity along multi-hop paths,
