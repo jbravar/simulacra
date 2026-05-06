@@ -438,6 +438,43 @@ impl<P, L: LatencyModel> Network<P, L> {
         self.partitions.contains(&partition_key(a, b))
     }
 
+    /// Fails the bidirectional link between `a` and `b` at the topology
+    /// level. Subsequent routing decisions will exclude the failed edges,
+    /// so sends whose shortest path required this link will either reroute
+    /// around it or drop with [`DropReason::NoRoute`].
+    ///
+    /// In-flight messages already scheduled for delivery are not affected.
+    /// For an asymmetric failure, use [`Network::fail_link_directed`].
+    pub fn fail_link(&mut self, a: NodeId, b: NodeId) {
+        self.topology.fail_link(a, b);
+    }
+
+    /// Restores a previously-failed bidirectional link between `a` and `b`.
+    pub fn heal_link(&mut self, a: NodeId, b: NodeId) {
+        self.topology.heal_link(a, b);
+    }
+
+    /// Returns `true` if both directions of the link between `a` and `b`
+    /// are currently failed.
+    pub fn is_link_failed(&self, a: NodeId, b: NodeId) -> bool {
+        self.topology.is_link_failed(a, b)
+    }
+
+    /// Fails a single direction of the link between `src` and `dst`.
+    pub fn fail_link_directed(&mut self, src: NodeId, dst: NodeId) {
+        self.topology.fail_link_directed(src, dst);
+    }
+
+    /// Restores a single direction of the link between `src` and `dst`.
+    pub fn heal_link_directed(&mut self, src: NodeId, dst: NodeId) {
+        self.topology.heal_link_directed(src, dst);
+    }
+
+    /// Returns `true` if the directed edge `src -> dst` is failed.
+    pub fn is_link_failed_directed(&self, src: NodeId, dst: NodeId) -> bool {
+        self.topology.is_link_failed_directed(src, dst)
+    }
+
     /// Sets the network configuration.
     pub fn with_config(mut self, config: NetConfig) -> Self {
         self.config = config;
@@ -868,6 +905,38 @@ impl<P, L: LatencyModel> RunContext<P, L> {
     /// Returns `true` if `a` and `b` are currently partitioned.
     pub fn is_partitioned(&self, a: NodeId, b: NodeId) -> bool {
         self.partitions.contains(&partition_key(a, b))
+    }
+
+    /// Fails the bidirectional link between `a` and `b` mid-run. See
+    /// [`Network::fail_link`] for semantics.
+    pub fn fail_link(&mut self, a: NodeId, b: NodeId) {
+        self.topology.fail_link(a, b);
+    }
+
+    /// Restores a previously-failed bidirectional link between `a` and `b`.
+    pub fn heal_link(&mut self, a: NodeId, b: NodeId) {
+        self.topology.heal_link(a, b);
+    }
+
+    /// Returns `true` if both directions of the link between `a` and `b`
+    /// are currently failed.
+    pub fn is_link_failed(&self, a: NodeId, b: NodeId) -> bool {
+        self.topology.is_link_failed(a, b)
+    }
+
+    /// Fails a single direction of the link between `src` and `dst`.
+    pub fn fail_link_directed(&mut self, src: NodeId, dst: NodeId) {
+        self.topology.fail_link_directed(src, dst);
+    }
+
+    /// Restores a single direction of the link between `src` and `dst`.
+    pub fn heal_link_directed(&mut self, src: NodeId, dst: NodeId) {
+        self.topology.heal_link_directed(src, dst);
+    }
+
+    /// Returns `true` if the directed edge `src -> dst` is failed.
+    pub fn is_link_failed_directed(&self, src: NodeId, dst: NodeId) -> bool {
+        self.topology.is_link_failed_directed(src, dst)
     }
 
     /// Returns a reference to the topology.
@@ -1614,6 +1683,164 @@ mod tests {
             max_time > Time::from_millis(10),
             "expected at least one spike beyond base latency, got max_time = {}",
             max_time
+        );
+    }
+
+    #[test]
+    fn fail_link_drops_with_no_route_when_no_alternate() {
+        // Line 0 -- 1 -- 2; failing 0-1 isolates 2 from 0.
+        let topo = TopologyBuilder::new(3)
+            .link(0u32, 1u32, Duration::from_millis(10))
+            .link(1u32, 2u32, Duration::from_millis(10))
+            .build();
+
+        let mut net = Network::new(topo, 42);
+        net.fail_link(NodeId(0), NodeId(1));
+        net.send(NodeId(0), NodeId(2), "stuck");
+
+        let mut dropped = Vec::new();
+        let stats = net.run(|_ctx, event| {
+            if let NetEvent::Drop { reason, .. } = event {
+                dropped.push(reason);
+            }
+        });
+
+        assert_eq!(stats.messages_delivered, 0);
+        assert_eq!(stats.messages_dropped, 1);
+        assert_eq!(dropped, vec![DropReason::NoRoute]);
+    }
+
+    #[test]
+    fn fail_link_reroutes_via_alternate_path() {
+        // Triangle: direct 0-2 = 100ms, indirect 0-1-2 = 20ms. Normal
+        // routing prefers the indirect path; failing 0-1 forces fallback
+        // to the direct edge and the message must still arrive.
+        let topo = TopologyBuilder::new(3)
+            .link(0u32, 1u32, Duration::from_millis(10))
+            .link(1u32, 2u32, Duration::from_millis(10))
+            .link(0u32, 2u32, Duration::from_millis(100))
+            .build();
+
+        let mut net = Network::new(topo, 42);
+        net.fail_link(NodeId(0), NodeId(1));
+        net.send(NodeId(0), NodeId(2), "long way");
+
+        let mut arrivals = Vec::new();
+        let stats = net.run(|ctx, event| {
+            if let NetEvent::Deliver(_) = event {
+                arrivals.push(ctx.now());
+            }
+        });
+
+        assert_eq!(stats.messages_delivered, 1);
+        assert_eq!(arrivals, vec![Time::from_millis(100)]);
+    }
+
+    #[test]
+    fn fail_link_directed_blocks_only_that_direction() {
+        // Bidirectional link 0<->1 with 0->1 failed only.
+        // Send 0->1 must drop NoRoute; send 1->0 must arrive.
+        let topo = TopologyBuilder::new(2)
+            .link(0u32, 1u32, Duration::from_millis(10))
+            .build();
+
+        let mut net = Network::new(topo, 42);
+        net.fail_link_directed(NodeId(0), NodeId(1));
+        net.send(NodeId(0), NodeId(1), "blocked");
+        net.send(NodeId(1), NodeId(0), "ok");
+
+        let mut delivered = Vec::new();
+        let mut dropped = Vec::new();
+        net.run(|_ctx, event| match event {
+            NetEvent::Deliver(msg) => delivered.push(msg.payload),
+            NetEvent::Drop { message, reason } => dropped.push((message.payload, reason)),
+        });
+
+        assert_eq!(delivered, vec!["ok"]);
+        assert_eq!(dropped, vec![("blocked", DropReason::NoRoute)]);
+    }
+
+    #[test]
+    fn run_context_can_fail_and_heal_mid_run() {
+        // Three reply messages issued from inside the handler — these go
+        // through `pending_sends` and route against the *current* topology,
+        // so fail/heal toggled mid-run takes effect. Use distinct timed
+        // self-ticks at t={0, 20, 40}ms to drive the fail/heal sequence.
+        let topo = TopologyBuilder::new(3)
+            .link(0u32, 1u32, Duration::from_millis(10))
+            .link(0u32, 2u32, Duration::from_millis(10))
+            .build();
+
+        let mut net: Network<u32> = Network::new(topo, 42);
+        // Self-ticks on node 0 at distinct times to drive mid-run actions.
+        net.send_at(Time::from_millis(0), NodeId(0), NodeId(0), 100);
+        net.send_at(Time::from_millis(20), NodeId(0), NodeId(0), 200);
+        net.send_at(Time::from_millis(40), NodeId(0), NodeId(0), 300);
+
+        let mut outcomes = Vec::new();
+        net.run(|ctx, event| match event {
+            NetEvent::Deliver(msg) if msg.dst == NodeId(0) => match msg.payload {
+                100 => {
+                    // First tick: send to node 1, link is healthy — must deliver.
+                    ctx.send(NodeId(0), NodeId(1), 1);
+                }
+                200 => {
+                    // Second tick: fail the link, then send to node 1 — must drop.
+                    ctx.fail_link(NodeId(0), NodeId(1));
+                    ctx.send(NodeId(0), NodeId(1), 2);
+                }
+                300 => {
+                    // Third tick: heal, then send to node 1 — must deliver again.
+                    ctx.heal_link(NodeId(0), NodeId(1));
+                    ctx.send(NodeId(0), NodeId(1), 3);
+                }
+                _ => {}
+            },
+            NetEvent::Deliver(msg) if msg.dst == NodeId(1) => {
+                outcomes.push((msg.payload, "delivered"));
+            }
+            NetEvent::Drop {
+                message,
+                reason: DropReason::NoRoute,
+            } => {
+                outcomes.push((message.payload, "no_route"));
+            }
+            _ => {}
+        });
+
+        assert_eq!(
+            outcomes,
+            vec![(1, "delivered"), (2, "no_route"), (3, "delivered")]
+        );
+    }
+
+    #[test]
+    fn fail_link_does_not_affect_in_flight_messages() {
+        // A message scheduled for delivery survives a mid-flight link failure.
+        // Send 0->1 (10ms in flight), schedule a self-tick on node 1 at t=5ms,
+        // and use that tick to fail the 0-1 link mid-flight. The in-flight
+        // message must still arrive at t=10ms.
+        let topo = TopologyBuilder::new(2)
+            .link(0u32, 1u32, Duration::from_millis(10))
+            .build();
+
+        let mut net: Network<&'static str> = Network::new(topo, 42);
+        net.send(NodeId(0), NodeId(1), "in_flight");
+        net.send_at(Time::from_millis(5), NodeId(1), NodeId(1), "tick");
+
+        let mut delivered = Vec::new();
+        net.run(|ctx, event| {
+            if let NetEvent::Deliver(msg) = event {
+                if msg.payload == "tick" {
+                    ctx.fail_link(NodeId(0), NodeId(1));
+                }
+                delivered.push((msg.payload, ctx.now()));
+            }
+        });
+
+        assert!(
+            delivered.contains(&("in_flight", Time::from_millis(10))),
+            "in-flight message must survive mid-flight fail; got {delivered:?}"
         );
     }
 

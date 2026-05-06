@@ -117,6 +117,39 @@ impl<P, L: LatencyModel> TracedNetwork<P, L> {
         self.network.is_partitioned(a, b)
     }
 
+    /// Fails the bidirectional link between `a` and `b`. See
+    /// [`Network::fail_link`].
+    pub fn fail_link(&mut self, a: NodeId, b: NodeId) {
+        self.network.fail_link(a, b);
+    }
+
+    /// Restores a previously-failed bidirectional link. See
+    /// [`Network::heal_link`].
+    pub fn heal_link(&mut self, a: NodeId, b: NodeId) {
+        self.network.heal_link(a, b);
+    }
+
+    /// Returns `true` if both directions of the link between `a` and `b`
+    /// are currently failed.
+    pub fn is_link_failed(&self, a: NodeId, b: NodeId) -> bool {
+        self.network.is_link_failed(a, b)
+    }
+
+    /// Fails a single direction of the link between `src` and `dst`.
+    pub fn fail_link_directed(&mut self, src: NodeId, dst: NodeId) {
+        self.network.fail_link_directed(src, dst);
+    }
+
+    /// Restores a single direction of the link between `src` and `dst`.
+    pub fn heal_link_directed(&mut self, src: NodeId, dst: NodeId) {
+        self.network.heal_link_directed(src, dst);
+    }
+
+    /// Returns `true` if the directed edge `src -> dst` is failed.
+    pub fn is_link_failed_directed(&self, src: NodeId, dst: NodeId) -> bool {
+        self.network.is_link_failed_directed(src, dst)
+    }
+
     /// Returns the current simulated time.
     pub fn now(&self) -> Time {
         self.network.now()
@@ -135,6 +168,31 @@ impl<P, L: LatencyModel> TracedNetwork<P, L> {
     /// Sends a message.
     pub fn send(&mut self, src: NodeId, dst: NodeId, payload: P) -> Option<crate::net::MessageId> {
         self.network.send(src, dst, payload)
+    }
+
+    /// Sends a message at a specific simulated time. See [`Network::send_at`].
+    pub fn send_at(
+        &mut self,
+        time: Time,
+        src: NodeId,
+        dst: NodeId,
+        payload: P,
+    ) -> Option<crate::net::MessageId> {
+        self.network.send_at(time, src, dst, payload)
+    }
+
+    /// Sends a sized message at a specific simulated time. See
+    /// [`Network::send_at_sized`].
+    pub fn send_at_sized(
+        &mut self,
+        time: Time,
+        src: NodeId,
+        dst: NodeId,
+        payload: P,
+        size_bytes: u64,
+    ) -> Option<crate::net::MessageId> {
+        self.network
+            .send_at_sized(time, src, dst, payload, size_bytes)
     }
 
     /// Runs the simulation with tracing, returning both stats and trace.

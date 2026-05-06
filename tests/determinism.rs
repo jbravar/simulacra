@@ -7,7 +7,9 @@
 
 #![cfg(feature = "serde")]
 
-use simulacra::{Duration, NetConfig, NodeId, TopologyBuilder, TracedNetwork, UniformJitter};
+use simulacra::{
+    Duration, NetConfig, NetEvent, NodeId, TopologyBuilder, TracedNetwork, UniformJitter,
+};
 
 /// A deliberately non-trivial scenario: 20-node ring, jitter + packet loss,
 /// cross-traffic from every node to the node two hops ahead.
@@ -65,6 +67,93 @@ fn ring_gossip_scenario_differs_across_seeds() {
         a, b,
         "two runs with different seeds produced identical traces; \
          the RNG is probably not being consulted"
+    );
+}
+
+/// Mid-run link failure scenario. Builds a triangle topology where the
+/// fast indirect path (0-1-2) is twice as good as the direct edge (0-2).
+/// A series of self-ticks drives `ctx.fail_link` / `ctx.heal_link` actions
+/// in the handler, producing a mix of normal deliveries, reroute via the
+/// slower direct path, and `NoRoute` drops while the network is fully
+/// partitioned.
+fn run_link_failure_scenario(seed: u64) -> String {
+    let topology = TopologyBuilder::new(3)
+        .link(0u32, 1u32, Duration::from_millis(5))
+        .link(1u32, 2u32, Duration::from_millis(5))
+        .link(0u32, 2u32, Duration::from_millis(50))
+        .build();
+
+    let latency_model = UniformJitter::new(Duration::from_millis(1));
+    let mut net = TracedNetwork::<u64, _>::with_latency_model(topology, latency_model, seed);
+
+    // Self-ticks on node 0 drive fail/heal actions at deterministic times.
+    // Use the payload as a tag to dispatch in the handler.
+    for (i, t) in [(1u64, 0), (2, 30), (3, 60), (4, 90)].iter() {
+        let _ = net.send_at(simulacra::Time::from_millis(*t), NodeId(0), NodeId(0), *i);
+    }
+
+    let (_stats, trace) = net.run_traced(|ctx, event| {
+        if let NetEvent::Deliver(msg) = event
+            && msg.dst == NodeId(0)
+        {
+            match msg.payload {
+                1 => {
+                    // Healthy: indirect path 0->1->2.
+                    ctx.send(NodeId(0), NodeId(2), 100);
+                }
+                2 => {
+                    // Fail the indirect path; reroute via slow direct edge.
+                    ctx.fail_link(NodeId(0), NodeId(1));
+                    ctx.send(NodeId(0), NodeId(2), 200);
+                }
+                3 => {
+                    // Also fail the direct edge: full partition, NoRoute drop.
+                    ctx.fail_link(NodeId(0), NodeId(2));
+                    ctx.send(NodeId(0), NodeId(2), 300);
+                }
+                4 => {
+                    // Heal both: back to fast indirect path.
+                    ctx.heal_link(NodeId(0), NodeId(1));
+                    ctx.heal_link(NodeId(0), NodeId(2));
+                    ctx.send(NodeId(0), NodeId(2), 400);
+                }
+                _ => {}
+            }
+        }
+    });
+
+    trace
+        .to_json()
+        .expect("trace should serialize to JSON cleanly")
+}
+
+#[test]
+fn link_failure_scenario_is_byte_equal_across_runs() {
+    let a = run_link_failure_scenario(0xC0FFEE);
+    let b = run_link_failure_scenario(0xC0FFEE);
+    assert_eq!(
+        a, b,
+        "two runs with the same seed and fail/heal sequence produced \
+         different JSON traces; link-failure determinism has regressed"
+    );
+}
+
+#[test]
+fn link_failure_scenario_includes_reroute_and_noroute() {
+    // The scenario must exercise the full failure surface: at least one
+    // delivery (reroute via direct path) and at least one NoRoute drop
+    // (full partition window). If either disappears, the test stopped
+    // exercising what its name claims.
+    let trace = run_link_failure_scenario(0xC0FFEE);
+    assert!(
+        trace.contains("\"NoRoute\""),
+        "expected at least one NoRoute drop in the trace"
+    );
+    let delivered = trace.matches("\"Delivered\"").count();
+    assert!(
+        delivered >= 3,
+        "expected at least 3 deliveries (ticks + at least one app message); \
+         got {delivered}"
     );
 }
 

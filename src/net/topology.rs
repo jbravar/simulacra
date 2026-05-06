@@ -4,7 +4,7 @@
 //! has an associated latency.
 
 use std::cmp::Ordering;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashSet};
 
 use super::node::NodeId;
 use crate::net::DropPolicy;
@@ -78,6 +78,12 @@ pub struct Topology {
     /// unreachable pairs are left as `None` within the cache since
     /// recomputing them is cheap and avoids a three-state enum.
     routes: Option<Vec<Option<Route>>>,
+    /// Directed edges that are currently failed and must be excluded from
+    /// routing. Stored as `(src, dst)` pairs; symmetric failures hold both
+    /// orderings. Membership is treated as advisory by Dijkstra — a failed
+    /// link that doesn't physically exist is simply a no-op for routing,
+    /// which lets callers "pre-fail" links before adding them.
+    failed_links: HashSet<(NodeId, NodeId)>,
     /// Scratch buffer for Dijkstra distances, sized to `node_count`.
     dist_scratch: Vec<u64>,
     /// Scratch buffer for Dijkstra predecessors, sized to `node_count`.
@@ -109,6 +115,7 @@ impl Topology {
             node_count,
             adjacency: vec![Vec::new(); node_count],
             routes: None,
+            failed_links: HashSet::new(),
             dist_scratch: Vec::with_capacity(node_count),
             prev_scratch: Vec::with_capacity(node_count),
             heap_scratch: BinaryHeap::new(),
@@ -280,6 +287,9 @@ impl Topology {
             }
 
             for link in &self.adjacency[node.as_usize()] {
+                if self.failed_links.contains(&(node, link.target)) {
+                    continue;
+                }
                 let next_cost = cost.saturating_add(link.latency.as_nanos());
                 if next_cost < self.dist_scratch[link.target.as_usize()] {
                     self.dist_scratch[link.target.as_usize()] = next_cost;
@@ -322,6 +332,62 @@ impl Topology {
             total_latency: Duration::from_nanos(self.dist_scratch[dst.as_usize()]),
             hop_count,
         })
+    }
+
+    /// Marks the directed edge `src -> dst` as failed.
+    ///
+    /// Failed edges are excluded from routing: subsequent `route()` calls
+    /// behave as if the edge does not exist (the route may reroute around
+    /// it, or return `None` if no alternative path remains).
+    ///
+    /// Failure is recorded as a `(src, dst)` pair regardless of whether such
+    /// a link physically exists in the adjacency list — pre-failing a link
+    /// before it's added is a no-op for routing but is still tracked, so a
+    /// later `add_link` followed by a `route()` will see the link as failed.
+    ///
+    /// Use [`Topology::fail_link`] for the symmetric (bidirectional) case.
+    /// In-flight messages already scheduled for delivery are not affected;
+    /// only future routing decisions are.
+    pub fn fail_link_directed(&mut self, src: NodeId, dst: NodeId) {
+        if self.failed_links.insert((src, dst)) {
+            self.clear_route_cache();
+        }
+    }
+
+    /// Restores a previously-failed directed edge `src -> dst`.
+    pub fn heal_link_directed(&mut self, src: NodeId, dst: NodeId) {
+        if self.failed_links.remove(&(src, dst)) {
+            self.clear_route_cache();
+        }
+    }
+
+    /// Returns `true` if the directed edge `src -> dst` is currently marked
+    /// as failed.
+    pub fn is_link_failed_directed(&self, src: NodeId, dst: NodeId) -> bool {
+        self.failed_links.contains(&(src, dst))
+    }
+
+    /// Marks the link between `a` and `b` as failed in both directions.
+    ///
+    /// Convenience wrapper that calls `fail_link_directed` for both
+    /// `(a, b)` and `(b, a)`. For asymmetric failures, use
+    /// [`Topology::fail_link_directed`].
+    pub fn fail_link(&mut self, a: NodeId, b: NodeId) {
+        self.fail_link_directed(a, b);
+        self.fail_link_directed(b, a);
+    }
+
+    /// Restores a previously-failed bidirectional link between `a` and `b`.
+    pub fn heal_link(&mut self, a: NodeId, b: NodeId) {
+        self.heal_link_directed(a, b);
+        self.heal_link_directed(b, a);
+    }
+
+    /// Returns `true` if both directions of the link between `a` and `b`
+    /// are currently failed. For an asymmetric check, use
+    /// [`Topology::is_link_failed_directed`].
+    pub fn is_link_failed(&self, a: NodeId, b: NodeId) -> bool {
+        self.is_link_failed_directed(a, b) && self.is_link_failed_directed(b, a)
     }
 
     /// Precomputes all shortest paths (Floyd-Warshall style, but using Dijkstra from each node).
@@ -712,5 +778,108 @@ mod tests {
         let route2 = topo.route(NodeId(0), NodeId(2)).unwrap();
 
         assert_eq!(route1.total_latency, route2.total_latency);
+    }
+
+    #[test]
+    fn fail_link_reroutes_around_failure() {
+        // Triangle: 0-1 (10ms), 1-2 (10ms), 0-2 (100ms).
+        // Direct 0->2 normally takes the 0-1-2 path (20ms). Fail the 0-1
+        // link and routing must fall back to the slower direct edge.
+        let mut topo = Topology::new(3);
+        topo.add_bidi_link(NodeId(0), NodeId(1), Duration::from_millis(10));
+        topo.add_bidi_link(NodeId(1), NodeId(2), Duration::from_millis(10));
+        topo.add_bidi_link(NodeId(0), NodeId(2), Duration::from_millis(100));
+
+        assert_eq!(
+            topo.route(NodeId(0), NodeId(2)).unwrap().total_latency,
+            Duration::from_millis(20)
+        );
+
+        topo.fail_link(NodeId(0), NodeId(1));
+        assert!(topo.is_link_failed(NodeId(0), NodeId(1)));
+
+        let rerouted = topo.route(NodeId(0), NodeId(2)).unwrap();
+        assert_eq!(rerouted.next_hop, NodeId(2));
+        assert_eq!(rerouted.total_latency, Duration::from_millis(100));
+    }
+
+    #[test]
+    fn fail_link_drops_to_no_route_when_no_alt() {
+        // Line: 0 -- 1 -- 2. Failing 0-1 isolates 2 from 0 entirely.
+        let mut topo = Topology::new(3);
+        topo.add_bidi_link(NodeId(0), NodeId(1), Duration::from_millis(10));
+        topo.add_bidi_link(NodeId(1), NodeId(2), Duration::from_millis(10));
+
+        assert!(topo.route(NodeId(0), NodeId(2)).is_some());
+        topo.fail_link(NodeId(0), NodeId(1));
+        assert!(topo.route(NodeId(0), NodeId(2)).is_none());
+    }
+
+    #[test]
+    fn heal_link_restores_route() {
+        let mut topo = Topology::new(3);
+        topo.add_bidi_link(NodeId(0), NodeId(1), Duration::from_millis(10));
+        topo.add_bidi_link(NodeId(1), NodeId(2), Duration::from_millis(10));
+
+        topo.fail_link(NodeId(0), NodeId(1));
+        assert!(topo.route(NodeId(0), NodeId(2)).is_none());
+
+        topo.heal_link(NodeId(0), NodeId(1));
+        assert!(!topo.is_link_failed(NodeId(0), NodeId(1)));
+        let route = topo.route(NodeId(0), NodeId(2)).unwrap();
+        assert_eq!(route.total_latency, Duration::from_millis(20));
+    }
+
+    #[test]
+    fn fail_link_directed_is_asymmetric() {
+        // Symmetric link 0-1 with directed-only failure of 0->1.
+        // 1->0 must still route directly; 0->1 falls through to NoRoute.
+        let mut topo = Topology::new(2);
+        topo.add_bidi_link(NodeId(0), NodeId(1), Duration::from_millis(10));
+
+        topo.fail_link_directed(NodeId(0), NodeId(1));
+        assert!(topo.is_link_failed_directed(NodeId(0), NodeId(1)));
+        assert!(!topo.is_link_failed_directed(NodeId(1), NodeId(0)));
+        // Symmetric query reports false because only one direction is down.
+        assert!(!topo.is_link_failed(NodeId(0), NodeId(1)));
+
+        assert!(topo.route(NodeId(0), NodeId(1)).is_none());
+        assert_eq!(
+            topo.route(NodeId(1), NodeId(0)).unwrap().total_latency,
+            Duration::from_millis(10)
+        );
+    }
+
+    #[test]
+    fn fail_link_invalidates_route_cache() {
+        // Without cache invalidation, the second route() would still return
+        // the pre-failure path. Verify by routing first (populating the
+        // cache), then failing, then routing again.
+        let mut topo = Topology::new(3);
+        topo.add_bidi_link(NodeId(0), NodeId(1), Duration::from_millis(10));
+        topo.add_bidi_link(NodeId(1), NodeId(2), Duration::from_millis(10));
+        topo.add_bidi_link(NodeId(0), NodeId(2), Duration::from_millis(100));
+
+        let _warm = topo.route(NodeId(0), NodeId(2)).unwrap();
+        topo.fail_link(NodeId(0), NodeId(1));
+        assert_eq!(
+            topo.route(NodeId(0), NodeId(2)).unwrap().total_latency,
+            Duration::from_millis(100)
+        );
+    }
+
+    #[test]
+    fn fail_nonexistent_link_is_noop_for_existing_routes() {
+        // Failing an edge that doesn't exist in the adjacency list must not
+        // affect any actual routing decisions.
+        let mut topo = Topology::new(3);
+        topo.add_bidi_link(NodeId(0), NodeId(1), Duration::from_millis(10));
+        topo.add_bidi_link(NodeId(1), NodeId(2), Duration::from_millis(10));
+
+        topo.fail_link(NodeId(0), NodeId(2));
+        assert!(topo.is_link_failed(NodeId(0), NodeId(2)));
+
+        let route = topo.route(NodeId(0), NodeId(2)).unwrap();
+        assert_eq!(route.total_latency, Duration::from_millis(20));
     }
 }
