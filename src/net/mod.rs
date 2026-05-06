@@ -475,6 +475,24 @@ impl<P, L: LatencyModel> Network<P, L> {
         self.topology.is_link_failed_directed(src, dst)
     }
 
+    /// Marks `node` as failed at the topology level. All routes whose
+    /// source, destination, or any intermediate hop is failed will return
+    /// no route, dropping affected sends with [`DropReason::NoRoute`].
+    /// In-flight messages already scheduled for delivery are not affected.
+    pub fn fail_node(&mut self, node: NodeId) {
+        self.topology.fail_node(node);
+    }
+
+    /// Restores a previously-failed node.
+    pub fn heal_node(&mut self, node: NodeId) {
+        self.topology.heal_node(node);
+    }
+
+    /// Returns `true` if `node` is currently marked as failed.
+    pub fn is_node_failed(&self, node: NodeId) -> bool {
+        self.topology.is_node_failed(node)
+    }
+
     /// Sets the network configuration.
     pub fn with_config(mut self, config: NetConfig) -> Self {
         self.config = config;
@@ -937,6 +955,21 @@ impl<P, L: LatencyModel> RunContext<P, L> {
     /// Returns `true` if the directed edge `src -> dst` is failed.
     pub fn is_link_failed_directed(&self, src: NodeId, dst: NodeId) -> bool {
         self.topology.is_link_failed_directed(src, dst)
+    }
+
+    /// Marks `node` as failed mid-run. See [`Network::fail_node`].
+    pub fn fail_node(&mut self, node: NodeId) {
+        self.topology.fail_node(node);
+    }
+
+    /// Restores a previously-failed node.
+    pub fn heal_node(&mut self, node: NodeId) {
+        self.topology.heal_node(node);
+    }
+
+    /// Returns `true` if `node` is currently marked as failed.
+    pub fn is_node_failed(&self, node: NodeId) -> bool {
+        self.topology.is_node_failed(node)
     }
 
     /// Returns a reference to the topology.
@@ -1842,6 +1875,128 @@ mod tests {
             delivered.contains(&("in_flight", Time::from_millis(10))),
             "in-flight message must survive mid-flight fail; got {delivered:?}"
         );
+    }
+
+    #[test]
+    fn fail_node_drops_with_no_route_when_no_alternate() {
+        // Line 0 -- 1 -- 2; failing node 1 isolates 2 from 0.
+        let topo = TopologyBuilder::new(3)
+            .link(0u32, 1u32, Duration::from_millis(10))
+            .link(1u32, 2u32, Duration::from_millis(10))
+            .build();
+
+        let mut net = Network::new(topo, 42);
+        net.fail_node(NodeId(1));
+        assert!(net.is_node_failed(NodeId(1)));
+        net.send(NodeId(0), NodeId(2), "stuck");
+
+        let mut dropped = Vec::new();
+        let stats = net.run(|_ctx, event| {
+            if let NetEvent::Drop { reason, .. } = event {
+                dropped.push(reason);
+            }
+        });
+
+        assert_eq!(stats.messages_delivered, 0);
+        assert_eq!(dropped, vec![DropReason::NoRoute]);
+    }
+
+    #[test]
+    fn fail_node_reroutes_via_alternate_path() {
+        // Diamond: 0 -> {1, 2} -> 3, where 1 is fast and 2 is slow.
+        // Failing node 1 forces traffic through 2.
+        let topo = TopologyBuilder::new(4)
+            .link(0u32, 1u32, Duration::from_millis(5))
+            .link(1u32, 3u32, Duration::from_millis(5))
+            .link(0u32, 2u32, Duration::from_millis(50))
+            .link(2u32, 3u32, Duration::from_millis(50))
+            .build();
+
+        let mut net = Network::new(topo, 42);
+        net.fail_node(NodeId(1));
+        net.send(NodeId(0), NodeId(3), "long way");
+
+        let mut arrivals = Vec::new();
+        let stats = net.run(|ctx, event| {
+            if let NetEvent::Deliver(_) = event {
+                arrivals.push(ctx.now());
+            }
+        });
+
+        assert_eq!(stats.messages_delivered, 1);
+        assert_eq!(arrivals, vec![Time::from_millis(100)]);
+    }
+
+    #[test]
+    fn fail_node_blocks_sends_targeting_failed_node() {
+        let topo = TopologyBuilder::new(2)
+            .link(0u32, 1u32, Duration::from_millis(10))
+            .build();
+
+        let mut net = Network::new(topo, 42);
+        net.fail_node(NodeId(1));
+        net.send(NodeId(0), NodeId(1), "to_dead_node");
+        net.send(NodeId(1), NodeId(0), "from_dead_node");
+
+        let mut dropped = Vec::new();
+        let stats = net.run(|_ctx, event| {
+            if let NetEvent::Drop { message, reason } = event {
+                dropped.push((message.payload, reason));
+            }
+        });
+
+        assert_eq!(stats.messages_delivered, 0);
+        assert_eq!(stats.messages_dropped, 2);
+        assert!(dropped.iter().all(|(_, r)| *r == DropReason::NoRoute));
+    }
+
+    #[test]
+    fn run_context_can_fail_and_heal_node_mid_run() {
+        // Diamond like the reroute test, but driven from inside the run loop.
+        // Tick 1: send through fast node 1 — must deliver.
+        // Tick 2: fail node 1, send — must reroute via slow node 2.
+        // Tick 3: heal node 1, send — must deliver via fast path again.
+        let topo = TopologyBuilder::new(4)
+            .link(0u32, 1u32, Duration::from_millis(5))
+            .link(1u32, 3u32, Duration::from_millis(5))
+            .link(0u32, 2u32, Duration::from_millis(50))
+            .link(2u32, 3u32, Duration::from_millis(50))
+            .build();
+
+        let mut net: Network<u32> = Network::new(topo, 42);
+        net.send_at(Time::from_millis(0), NodeId(0), NodeId(0), 100);
+        net.send_at(Time::from_millis(200), NodeId(0), NodeId(0), 200);
+        net.send_at(Time::from_millis(400), NodeId(0), NodeId(0), 300);
+
+        let mut hops_taken = Vec::new();
+        net.run(|ctx, event| match event {
+            NetEvent::Deliver(msg) if msg.dst == NodeId(0) => match msg.payload {
+                100 => {
+                    ctx.send(NodeId(0), NodeId(3), 1);
+                }
+                200 => {
+                    ctx.fail_node(NodeId(1));
+                    ctx.send(NodeId(0), NodeId(3), 2);
+                }
+                300 => {
+                    ctx.heal_node(NodeId(1));
+                    ctx.send(NodeId(0), NodeId(3), 3);
+                }
+                _ => {}
+            },
+            NetEvent::Deliver(msg) if msg.dst == NodeId(3) => {
+                hops_taken.push((msg.payload, ctx.now()));
+            }
+            _ => {}
+        });
+
+        // First and third deliver via fast path (10ms after their dispatch);
+        // second reroutes via slow path (100ms after its dispatch).
+        // Dispatches are 0ms, 200ms, 400ms; arrivals are 10, 300, 410.
+        assert_eq!(hops_taken.len(), 3);
+        assert_eq!(hops_taken[0], (1, Time::from_millis(10)));
+        assert_eq!(hops_taken[1], (2, Time::from_millis(300)));
+        assert_eq!(hops_taken[2], (3, Time::from_millis(410)));
     }
 
     #[test]

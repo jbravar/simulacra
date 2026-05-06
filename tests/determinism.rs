@@ -138,6 +138,84 @@ fn link_failure_scenario_is_byte_equal_across_runs() {
     );
 }
 
+/// Mid-run node failure scenario. Diamond topology where node 1 is the
+/// fast intermediate and node 2 is slow. Self-ticks drive `ctx.fail_node`
+/// / `ctx.heal_node`, exercising reroute and full isolation in the same run.
+fn run_node_failure_scenario(seed: u64) -> String {
+    let topology = TopologyBuilder::new(4)
+        .link(0u32, 1u32, Duration::from_millis(5))
+        .link(1u32, 3u32, Duration::from_millis(5))
+        .link(0u32, 2u32, Duration::from_millis(50))
+        .link(2u32, 3u32, Duration::from_millis(50))
+        .build();
+
+    let latency_model = UniformJitter::new(Duration::from_millis(1));
+    let mut net = TracedNetwork::<u64, _>::with_latency_model(topology, latency_model, seed);
+
+    for (tag, t) in [(1u64, 0u64), (2, 200), (3, 400), (4, 600)].iter() {
+        let _ = net.send_at(simulacra::Time::from_millis(*t), NodeId(0), NodeId(0), *tag);
+    }
+
+    let (_stats, trace) = net.run_traced(|ctx, event| {
+        if let NetEvent::Deliver(msg) = event
+            && msg.dst == NodeId(0)
+        {
+            match msg.payload {
+                1 => {
+                    // Healthy: route via fast node 1.
+                    ctx.send(NodeId(0), NodeId(3), 100);
+                }
+                2 => {
+                    // Fail node 1: reroute via slow node 2.
+                    ctx.fail_node(NodeId(1));
+                    ctx.send(NodeId(0), NodeId(3), 200);
+                }
+                3 => {
+                    // Also fail node 2: full isolation, NoRoute drop.
+                    ctx.fail_node(NodeId(2));
+                    ctx.send(NodeId(0), NodeId(3), 300);
+                }
+                4 => {
+                    // Heal node 1 only: fast path restored.
+                    ctx.heal_node(NodeId(1));
+                    ctx.send(NodeId(0), NodeId(3), 400);
+                }
+                _ => {}
+            }
+        }
+    });
+
+    trace
+        .to_json()
+        .expect("trace should serialize to JSON cleanly")
+}
+
+#[test]
+fn node_failure_scenario_is_byte_equal_across_runs() {
+    let a = run_node_failure_scenario(0xBEEF);
+    let b = run_node_failure_scenario(0xBEEF);
+    assert_eq!(
+        a, b,
+        "two runs with the same seed and node fail/heal sequence produced \
+         different JSON traces; node-failure determinism has regressed"
+    );
+}
+
+#[test]
+fn node_failure_scenario_includes_reroute_and_noroute() {
+    let trace = run_node_failure_scenario(0xBEEF);
+    assert!(
+        trace.contains("\"NoRoute\""),
+        "expected at least one NoRoute drop in the trace"
+    );
+    let delivered = trace.matches("\"Delivered\"").count();
+    assert!(
+        delivered >= 3,
+        "expected at least 3 deliveries (ticks + at least one app message); \
+         got {delivered}"
+    );
+}
+
 #[test]
 fn link_failure_scenario_includes_reroute_and_noroute() {
     // The scenario must exercise the full failure surface: at least one

@@ -84,6 +84,12 @@ pub struct Topology {
     /// link that doesn't physically exist is simply a no-op for routing,
     /// which lets callers "pre-fail" links before adding them.
     failed_links: HashSet<(NodeId, NodeId)>,
+    /// Nodes that are currently down. A failed node is excluded from
+    /// routing entirely: any route with a failed src, dst, or intermediate
+    /// hop returns `None`. This is orthogonal to `failed_links` — healing
+    /// a node does not implicitly heal individual link failures, and vice
+    /// versa.
+    failed_nodes: HashSet<NodeId>,
     /// Scratch buffer for Dijkstra distances, sized to `node_count`.
     dist_scratch: Vec<u64>,
     /// Scratch buffer for Dijkstra predecessors, sized to `node_count`.
@@ -116,6 +122,7 @@ impl Topology {
             adjacency: vec![Vec::new(); node_count],
             routes: None,
             failed_links: HashSet::new(),
+            failed_nodes: HashSet::new(),
             dist_scratch: Vec::with_capacity(node_count),
             prev_scratch: Vec::with_capacity(node_count),
             heap_scratch: BinaryHeap::new(),
@@ -267,6 +274,12 @@ impl Topology {
     fn compute_route(&mut self, src: NodeId, dst: NodeId) -> Option<Route> {
         let n = self.node_count;
 
+        // Fast paths: a failed source can't transmit and a failed
+        // destination can't receive, so no route exists either way.
+        if self.failed_nodes.contains(&src) || self.failed_nodes.contains(&dst) {
+            return None;
+        }
+
         // Reset scratch buffers without freeing their allocations.
         self.dist_scratch.clear();
         self.dist_scratch.resize(n, u64::MAX);
@@ -287,7 +300,9 @@ impl Topology {
             }
 
             for link in &self.adjacency[node.as_usize()] {
-                if self.failed_links.contains(&(node, link.target)) {
+                if self.failed_links.contains(&(node, link.target))
+                    || self.failed_nodes.contains(&link.target)
+                {
                     continue;
                 }
                 let next_cost = cost.saturating_add(link.latency.as_nanos());
@@ -388,6 +403,32 @@ impl Topology {
     /// [`Topology::is_link_failed_directed`].
     pub fn is_link_failed(&self, a: NodeId, b: NodeId) -> bool {
         self.is_link_failed_directed(a, b) && self.is_link_failed_directed(b, a)
+    }
+
+    /// Marks `node` as failed. A failed node is excluded from routing
+    /// entirely: any route whose source, destination, or any intermediate
+    /// hop is failed returns `None`, and consequently sends targeting it
+    /// drop with [`DropReason::NoRoute`](crate::net::DropReason::NoRoute).
+    ///
+    /// Node failure is orthogonal to link failure; healing a node does not
+    /// implicitly heal any individual link failures involving it. In-flight
+    /// messages already scheduled for delivery are not affected.
+    pub fn fail_node(&mut self, node: NodeId) {
+        if self.failed_nodes.insert(node) {
+            self.clear_route_cache();
+        }
+    }
+
+    /// Restores a previously-failed node.
+    pub fn heal_node(&mut self, node: NodeId) {
+        if self.failed_nodes.remove(&node) {
+            self.clear_route_cache();
+        }
+    }
+
+    /// Returns `true` if `node` is currently marked as failed.
+    pub fn is_node_failed(&self, node: NodeId) -> bool {
+        self.failed_nodes.contains(&node)
     }
 
     /// Precomputes all shortest paths (Floyd-Warshall style, but using Dijkstra from each node).
@@ -866,6 +907,101 @@ mod tests {
             topo.route(NodeId(0), NodeId(2)).unwrap().total_latency,
             Duration::from_millis(100)
         );
+    }
+
+    #[test]
+    fn fail_node_blocks_all_routing_through_it() {
+        // Diamond: 0 -> {1, 2} -> 3, where node 1 is the cheap intermediate
+        // (5ms each) and node 2 is the expensive one (50ms each). Failing
+        // node 1 must reroute traffic via node 2.
+        let mut topo = Topology::new(4);
+        topo.add_bidi_link(NodeId(0), NodeId(1), Duration::from_millis(5));
+        topo.add_bidi_link(NodeId(1), NodeId(3), Duration::from_millis(5));
+        topo.add_bidi_link(NodeId(0), NodeId(2), Duration::from_millis(50));
+        topo.add_bidi_link(NodeId(2), NodeId(3), Duration::from_millis(50));
+
+        assert_eq!(
+            topo.route(NodeId(0), NodeId(3)).unwrap().total_latency,
+            Duration::from_millis(10)
+        );
+
+        topo.fail_node(NodeId(1));
+        assert!(topo.is_node_failed(NodeId(1)));
+
+        let rerouted = topo.route(NodeId(0), NodeId(3)).unwrap();
+        assert_eq!(rerouted.next_hop, NodeId(2));
+        assert_eq!(rerouted.total_latency, Duration::from_millis(100));
+    }
+
+    #[test]
+    fn fail_node_isolates_when_no_alternate() {
+        // Line 0 -- 1 -- 2 with node 1 as the only intermediate.
+        let mut topo = Topology::new(3);
+        topo.add_bidi_link(NodeId(0), NodeId(1), Duration::from_millis(10));
+        topo.add_bidi_link(NodeId(1), NodeId(2), Duration::from_millis(10));
+
+        topo.fail_node(NodeId(1));
+        assert!(topo.route(NodeId(0), NodeId(2)).is_none());
+    }
+
+    #[test]
+    fn fail_node_blocks_routes_to_and_from_node() {
+        let mut topo = Topology::new(3);
+        topo.add_bidi_link(NodeId(0), NodeId(1), Duration::from_millis(10));
+        topo.add_bidi_link(NodeId(1), NodeId(2), Duration::from_millis(10));
+
+        topo.fail_node(NodeId(1));
+        // Routing to a failed node fails.
+        assert!(topo.route(NodeId(0), NodeId(1)).is_none());
+        // Routing from a failed node fails.
+        assert!(topo.route(NodeId(1), NodeId(0)).is_none());
+    }
+
+    #[test]
+    fn heal_node_restores_routing() {
+        let mut topo = Topology::new(3);
+        topo.add_bidi_link(NodeId(0), NodeId(1), Duration::from_millis(10));
+        topo.add_bidi_link(NodeId(1), NodeId(2), Duration::from_millis(10));
+
+        topo.fail_node(NodeId(1));
+        assert!(topo.route(NodeId(0), NodeId(2)).is_none());
+
+        topo.heal_node(NodeId(1));
+        assert!(!topo.is_node_failed(NodeId(1)));
+        assert_eq!(
+            topo.route(NodeId(0), NodeId(2)).unwrap().total_latency,
+            Duration::from_millis(20)
+        );
+    }
+
+    #[test]
+    fn fail_node_invalidates_route_cache() {
+        // Cache must invalidate on fail/heal so a stale route doesn't keep
+        // routing through a failed node.
+        let mut topo = Topology::new(3);
+        topo.add_bidi_link(NodeId(0), NodeId(1), Duration::from_millis(10));
+        topo.add_bidi_link(NodeId(1), NodeId(2), Duration::from_millis(10));
+
+        let _warm = topo.route(NodeId(0), NodeId(2)).unwrap();
+        topo.fail_node(NodeId(1));
+        assert!(topo.route(NodeId(0), NodeId(2)).is_none());
+    }
+
+    #[test]
+    fn node_and_link_failures_are_orthogonal() {
+        // Failing a node and then healing it must not also clear a link
+        // failure that was independently set.
+        let mut topo = Topology::new(3);
+        topo.add_bidi_link(NodeId(0), NodeId(1), Duration::from_millis(10));
+        topo.add_bidi_link(NodeId(1), NodeId(2), Duration::from_millis(10));
+
+        topo.fail_link(NodeId(0), NodeId(1));
+        topo.fail_node(NodeId(1));
+        topo.heal_node(NodeId(1));
+
+        // Link failure must still hold even though node is healed.
+        assert!(topo.is_link_failed(NodeId(0), NodeId(1)));
+        assert!(topo.route(NodeId(0), NodeId(2)).is_none());
     }
 
     #[test]

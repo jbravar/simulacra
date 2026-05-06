@@ -150,6 +150,21 @@ impl<P, L: LatencyModel> TracedNetwork<P, L> {
         self.network.is_link_failed_directed(src, dst)
     }
 
+    /// Marks `node` as failed. See [`Network::fail_node`].
+    pub fn fail_node(&mut self, node: NodeId) {
+        self.network.fail_node(node);
+    }
+
+    /// Restores a previously-failed node.
+    pub fn heal_node(&mut self, node: NodeId) {
+        self.network.heal_node(node);
+    }
+
+    /// Returns `true` if `node` is currently marked as failed.
+    pub fn is_node_failed(&self, node: NodeId) -> bool {
+        self.network.is_node_failed(node)
+    }
+
     /// Returns the current simulated time.
     pub fn now(&self) -> Time {
         self.network.now()

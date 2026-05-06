@@ -407,13 +407,14 @@ If that works deterministically, the nucleus of the project is sound.
   - pair-level partition/heal (`Network::partition` / `heal`) — initial commit
   - link failure with reroute (`Topology::fail_link` / `heal_link`,
     Dijkstra-aware) landed in 2026-05; in-flight messages survive
+  - node failure (`Topology::fail_node` / `heal_node`) landed in 2026-05;
+    excludes the node from routing as src, dst, or intermediate hop
 - minimal end-to-end bandwidth cap with per-`(src, dst)` serialization
   queueing landed in 2026-04 via `Network::set_bandwidth` + `send_sized`
 - full queueing and contention (per-link capacity along multi-hop paths,
   not just per-pair; still TODO)
-- node failure (composable from N-pair link failure; not yet a first-class API)
-- in-flight drop on partition/link-failure (currently survives; would need
-  event-queue surgery)
+- in-flight drop on partition/link-failure/node-failure (currently survives;
+  would need event-queue surgery)
 - partitioning experiments
 
 ## README draft
