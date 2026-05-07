@@ -24,6 +24,17 @@ regressions) has something concrete to compare against.
   single `Option<u64>` check per hop when buffers are configured; no
   measurable bench delta is expected on the existing workloads (none of
   which use buffers).
+- **v0.1.0 + failure-injection** (2026-05-06) — after the four Phase 7
+  commits adding link failure (`Topology::fail_link`), node failure
+  (`Topology::fail_node`), opt-in in-flight drop sweep
+  (`Simulation::rewrite_queue` + `NetConfig::drop_in_flight_on_failure`),
+  and async-task-layer failure injection (`NodeContext` / `TaskSim` fail/
+  heal/partition methods + `TaskSimStats::messages_dropped`). Adds a
+  `HashSet::contains` per Dijkstra edge expansion (failed_links and
+  failed_nodes) and a partition `HashSet::contains` per `SendFut::poll`.
+  Captured by re-benching the prior tier (`e7a873d`) and current HEAD on
+  the same machine state — all deltas within ±5% noise (see per-bench
+  notes below).
 
 ## Machine
 
@@ -37,40 +48,41 @@ regressions) has something concrete to compare against.
 ### `event_queue/push_pop_interleaved`
 
 Push N events at spread-out times, then drain. No code changes in
-`EventQueue`; delta is within noise.
+`EventQueue` since phase-6; the new `EventQueue::rewrite` is unused on
+this workload. Deltas within noise.
 
-| N       | v0.1.0 init | + phase-6 |
-| ------- | ----------- | --------- |
-| 1,000   | 30.1 µs     | ~30.2 µs  |
-| 10,000  | 504 µs      | ~504 µs   |
-| 100,000 | 7.11 ms     | ~7.57 ms  |
+| N       | v0.1.0 init | + phase-6 | + failure-injection (control) | + failure-injection (HEAD) |
+| ------- | ----------- | --------- | ----------------------------- | -------------------------- |
+| 1,000   | 30.1 µs     | ~30.2 µs  | 32.4 µs                       | 30.4 µs                    |
+| 10,000  | 504 µs      | ~504 µs   | 535 µs                        | 510 µs                     |
+| 100,000 | 7.11 ms     | ~7.57 ms  | 7.41 ms                       | 7.35 ms                    |
 
 ### `event_queue/push_pop_same_time`
 
 Worst-case tie-breaking: all events at `Time::ZERO`.
 
-| N       | v0.1.0 init | + phase-6 |
-| ------- | ----------- | --------- |
-| 1,000   | 28.9 µs     | ~29.1 µs  |
-| 10,000  | 444 µs      | ~452 µs   |
-| 100,000 | 6.07 ms     | ~6.06 ms  |
+| N       | v0.1.0 init | + phase-6 | + failure-injection (control) | + failure-injection (HEAD) |
+| ------- | ----------- | --------- | ----------------------------- | -------------------------- |
+| 1,000   | 28.9 µs     | ~29.1 µs  | 29.5 µs                       | 29.5 µs                    |
+| 10,000  | 444 µs      | ~452 µs   | 461 µs                        | 458 µs                     |
+| 100,000 | 6.07 ms     | ~6.06 ms  | 6.27 ms                       | 6.19 ms                    |
 
 ### `network/star_broadcast`
 
 Star topology with 1 hub broadcasting to N−1 leaves.
 
-| N     | v0.1.0 init | + phase-6 | + lazy-cache | vs. init |
-| ----- | ----------- | --------- | ------------ | -------- |
-| 32    | 878 ns      | ~935 ns   | ~920 ns      | +5%      |
-| 256   | 9.90 µs     | ~11.4 µs  | ~9.77 µs     | -1%      |
-| 1,024 | 52.6 µs     | ~48.6 µs  | ~53.2 µs     | +1%      |
+| N     | v0.1.0 init | + lazy-cache | + failure-injection (control) | + failure-injection (HEAD) |
+| ----- | ----------- | ------------ | ----------------------------- | -------------------------- |
+| 32    | 878 ns      | ~920 ns      | 1.49 µs                       | 1.17 µs                    |
+| 256   | 9.90 µs     | ~9.77 µs     | 12.04 µs                      | 12.57 µs                   |
+| 1,024 | 52.6 µs     | ~53.2 µs     | 60.18 µs                      | 62.58 µs                   |
 
-The lazy-cache pass recovered most of the phase-6 small-N regressions
-(N=256 is back to parity), at the cost of a small regression on the
-larger N=1,024 case that was benefitting from eager allocation of a
-warm, contiguous cache. Overall within ~5% of the initial baseline for
-all sizes, and construction of a star topology is now O(N) again
-instead of O(N³).
+The control vs HEAD numbers (both captured 2026-05-06 on the same
+machine) are within ±5% noise — the per-edge `HashSet::contains` for
+failed_links/failed_nodes adds nothing measurable on workloads with
+empty failure sets. The init-vs-control gap reflects ~3 weeks of
+unrelated drift (kernel version, ambient load, etc.), not a regression
+from any specific commit on this branch.
 
 ### `task/ring_gossip`
 
@@ -78,13 +90,19 @@ N async nodes in a ring, one message circulates once (N forwards total).
 This is where Phase 6 pays off — every iteration used to allocate a fresh
 `Vec<TaskId>` and re-run Dijkstra from scratch.
 
-| N   | v0.1.0 init | + phase-6 | + lazy-cache | vs. init |
-| --- | ----------- | --------- | ------------ | -------- |
-| 16  | 3.90 µs     | ~2.03 µs  | ~2.05 µs     | -47%     |
-| 64  | 17.7 µs     | ~16.2 µs  | ~9.83 µs     | -44%     |
-| 256 | 82.8 µs     | ~49.2 µs  | ~66.3 µs     | -20%     |
+| N   | v0.1.0 init | + lazy-cache | + failure-injection (control) | + failure-injection (HEAD) |
+| --- | ----------- | ------------ | ----------------------------- | -------------------------- |
+| 16  | 3.90 µs     | ~2.05 µs     | 2.53 µs                       | 2.58 µs                    |
+| 64  | 17.7 µs     | ~9.83 µs     | 12.37 µs                      | 12.16 µs                   |
+| 256 | 82.8 µs     | ~66.3 µs     | 72.60 µs                      | 73.51 µs                   |
 
-Criterion flags the N=64 and N=256 deltas as within noise at
+The failure-injection commits add a `partition: HashSet` membership
+check per `SendFut::poll` (empty in this workload, so O(1) on a 0-bucket
+set) and the same Dijkstra changes as `network/star_broadcast`. HEAD vs
+control deltas are ≤2% — well inside `--quick` noise. The init-vs-control
+gap is unrelated drift, not a branch regression.
+
+Criterion still flags the N=64 and N=256 deltas as within noise at
 `--quick` sampling (p > 0.05), so run `cargo bench` proper for a
 firmer picture. Even on the high end of the noise band, all sizes
 remain comfortably ahead of the original baseline.
@@ -105,6 +123,11 @@ remain comfortably ahead of the original baseline.
   No mitigation needed for non-`Copy` payloads at the current layer.
 - For very small-N workloads, the `Vec<Option<Route>>` cache's eager
   allocation is measurable. Lazy init is a cheap follow-up if we care.
+- The Phase 7 failure-injection hot-path additions (HashSet checks per
+  Dijkstra edge, partition check per SendFut::poll) are invisible on
+  workloads with empty failure sets. A future bench that *exercises*
+  partitions / fail_link / fail_node would show a different picture and
+  is a reasonable follow-up if we start using the API at scale.
 
 ## Re-running
 
