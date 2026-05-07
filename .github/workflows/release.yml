@@ -1,0 +1,58 @@
+name: Release
+
+# Triggered by pushing a `v*.*.*` tag whose value matches the version
+# in Cargo.toml. The workflow verifies the tag, runs the full test
+# suite, and publishes to crates.io. The CRATES_IO_TOKEN secret must
+# be configured on the repository (Settings → Secrets and variables →
+# Actions). The "crates-io" environment can additionally gate this
+# behind a manual approval if you want a sanity check before publish.
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  verify-tag:
+    name: verify tag matches Cargo.toml
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check tag matches Cargo.toml version
+        run: |
+          tag="${GITHUB_REF#refs/tags/v}"
+          cargo_version=$(grep '^version' Cargo.toml | head -1 | sed -E 's/.*"(.+)".*/\1/')
+          if [ "$tag" != "$cargo_version" ]; then
+            echo "::error::Tag v$tag does not match Cargo.toml version $cargo_version"
+            exit 1
+          fi
+          echo "Tag v$tag matches Cargo.toml version $cargo_version"
+
+  test:
+    name: full test suite
+    runs-on: ubuntu-latest
+    needs: verify-tag
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --all-targets --all-features
+      - run: cargo test --doc --all-features
+
+  publish:
+    name: publish to crates.io
+    runs-on: ubuntu-latest
+    needs: test
+    environment: crates-io
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: cargo publish

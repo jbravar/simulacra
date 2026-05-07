@@ -2,9 +2,15 @@
 name = "simulacra"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
 description = "A deterministic discrete-event simulation engine for message flow across large computer networks"
 license = "MIT"
 readme = "README.md"
+repository = "https://github.com/jbravar/simulacra"
+homepage = "https://github.com/jbravar/simulacra"
+documentation = "https://docs.rs/simulacra"
+keywords = ["simulation", "discrete-event", "deterministic", "network", "async"]
+categories = ["simulation", "asynchronous", "network-programming"]
 
 [features]
 default = []

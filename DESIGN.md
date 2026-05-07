@@ -4,7 +4,7 @@ A deterministic discrete-event simulation engine for message flow across large c
 
 ## Status
 
-Early design / prototype.
+v0.1 implementation complete: kernel, async task façade, network layer with topology / routing / bandwidth / buffers / drop policies, trace recording with JSON export, and a comprehensive failure-injection surface (partition, link failure with reroute, node failure, opt-in in-flight drop) usable from both the raw `Network<P, L>` API and the `TaskSim<M>` async façade. Determinism is enforced end-to-end via `tests/determinism.rs`. See `CHANGELOG.md` for the full surface and `Phase 7 follow-ups` below for what's open.
 
 ## Vision
 
