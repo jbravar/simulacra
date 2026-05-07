@@ -421,9 +421,42 @@ If that works deterministically, the nucleus of the project is sound.
     deliver-now" behavior in `SendFut`/`inject` with a clean drop.
 - minimal end-to-end bandwidth cap with per-`(src, dst)` serialization
   queueing landed in 2026-04 via `Network::set_bandwidth` + `send_sized`
-- full queueing and contention (per-link capacity along multi-hop paths,
-  not just per-pair; still TODO)
-- partitioning experiments
+
+#### Phase 7 follow-ups (open)
+
+Concrete next moves, ordered by rough effort, smallest first.
+
+1. **Failure-exercising bench.** All current benches have empty failure
+   sets, so the per-edge `HashSet::contains` in Dijkstra and the
+   partition check in `SendFut::poll` are invisible. Add a bench that
+   actually populates `failed_links` / `failed_nodes` / `partitions`
+   (e.g., 10% of edges failed) so future regressions on the failure
+   hot path become visible. Add a column to `docs/perf-baseline.md`.
+2. **Task-layer trace export.** `TaskSim` has its own `SimState` and
+   `EventQueue<TaskEvent<M>>`, separate from `Network`'s
+   `TracedNetwork`. Determinism tests today only cover the `Network`
+   path. Add a `TracedTaskSim<M>` (or `TaskSimBuilder::with_trace`)
+   that records `Delivered` / `Dropped` events with timestamps, then
+   add a task-layer scenario to `tests/determinism.rs`.
+3. **Time-bounded failure scheduler helper.** A common pattern is
+   "fail at T1, heal at T2." Today users implement it inline by
+   checking `ctx.now()` on each handler tick (see
+   `examples/failure_injection.rs`). A small helper —
+   `Scenario::fail_at(time, action)` or similar — would dedupe that
+   pattern.
+4. **In-flight drop in the async task layer.** `Network` has the opt-in
+   `NetConfig::drop_in_flight_on_failure`; `TaskSim` does not. Symmetry
+   would mean adding the same flag to `TaskSimBuilder` / `TaskSim` and
+   sweeping `events: EventQueue<TaskEvent<M>>` on failure mutators.
+   Mostly mechanical given the existing `EventQueue::rewrite` primitive.
+5. **Queueing disciplines beyond FIFO.** Per-link bandwidth + buffer +
+   tail/RED drop is in. Missing: priority queues, weighted fair
+   queueing (WFQ), traffic classes. Each is its own design exercise;
+   start by clarifying the user-visible API on `Topology` (e.g.,
+   `add_link_with_discipline(...)`).
+6. **Partitioning experiments.** Vague until a concrete protocol drives
+   the requirements. A small Raft-flavored or gossip-with-Byzantine
+   example would surface what's missing — likely related to (5) above.
 
 ## README draft
 
