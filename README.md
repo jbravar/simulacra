@@ -118,7 +118,9 @@ under simulated conditions.
 
 ## Current status
 
-Version 0.1.0 — implemented and tested, but **not yet published to crates.io**.
+Version 0.1.0 is **published on
+[crates.io](https://crates.io/crates/simulacra)**
+([docs](https://docs.rs/simulacra)); development continues toward 0.2.
 Alongside the deterministic kernel, async facade, and topology-aware delivery,
 0.1.0 ships full failure injection (link / node / partition with reroute), an
 end-to-end **bandwidth and congestion model** (per-link capacity, hop-by-hop
