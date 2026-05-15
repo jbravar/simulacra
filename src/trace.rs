@@ -27,6 +27,7 @@ pub const TRACE_SCHEMA_VERSION: u32 = 1;
 /// Format tag written into every serialized trace so foreign or
 /// hand-rolled JSON is rejected with a clear error instead of being
 /// silently mis-parsed into a structurally-similar `Trace`.
+#[cfg(feature = "serde")]
 const TRACE_FORMAT: &str = "simulacra-trace";
 
 /// A recorded event in a trace.

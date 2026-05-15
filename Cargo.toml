@@ -3,6 +3,7 @@ name = "simulacra"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
+authors = ["Julian Bravard <julian.bravard@gmail.com>"]
 description = "A deterministic discrete-event simulation engine for message flow across large computer networks"
 license = "MIT"
 readme = "README.md"
@@ -11,6 +12,13 @@ homepage = "https://github.com/jbravar/simulacra"
 documentation = "https://docs.rs/simulacra"
 keywords = ["simulation", "discrete-event", "deterministic", "network", "async"]
 categories = ["simulation", "asynchronous", "network-programming"]
+
+# Build docs.rs with all features so the serde-gated trace JSON / replay
+# API is visible — the default feature set is empty, so without this the
+# published docs would hide a core part of the crate.
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
 default = []
