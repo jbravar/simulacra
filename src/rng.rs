@@ -2,7 +2,7 @@
 //!
 //! All randomness in Simulacra is seeded and reproducible.
 
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
 use crate::time::Duration;
@@ -229,6 +229,80 @@ mod tests {
         let seq2: Vec<_> = (0..10).map(|_| child2.u64(1000)).collect();
 
         assert_eq!(seq1, seq2);
+    }
+
+    /// Cross-version RNG-stream guardrail.
+    ///
+    /// Every value Simulacra derives from a seed flows through the
+    /// `rand`/`rand_chacha` distribution layer (`random_range`, `random`,
+    /// `random_bool`, `fill`). `ChaCha8`'s raw bytes are algorithmically
+    /// stable, but that distribution layer is reworked at `rand`
+    /// minor/major boundaries — so a dependency bump can silently change
+    /// what every seed produces (jitter, packet loss, `choice`, `shuffle`,
+    /// forked sub-streams). Nothing else in the suite pins this: the
+    /// integration determinism test is only self-consistent within one
+    /// binary.
+    ///
+    /// These literals are the stream for seed 42. If a `rand`/`rand_chacha`
+    /// upgrade makes this test fail, that is a **deliberate, reviewable**
+    /// stream change: confirm the new values are sane (in range,
+    /// deterministic, distinct), re-bless the literals in the same commit,
+    /// and note it in `CHANGELOG.md`. Pinned on `rand` 0.10 / `rand_chacha`
+    /// 0.10.
+    #[test]
+    fn golden_stream_is_stable_across_dep_versions() {
+        let mut rng = SimRng::new(42);
+
+        let u: Vec<u64> = (0..8).map(|_| rng.u64(1_000_000)).collect();
+        assert_eq!(
+            u,
+            [
+                681896, 950275, 427516, 627360, 288593, 149958, 308040, 803872
+            ],
+            "u64 range stream (random_range over integers) changed"
+        );
+
+        let f: Vec<u64> = (0..4).map(|_| rng.f64().to_bits()).collect();
+        assert_eq!(
+            f,
+            [
+                4605122010988943809,
+                4597763960352646552,
+                4602740670442056384,
+                4606297940404477195
+            ],
+            "f64 stream (random::<f64>() bit pattern) changed"
+        );
+
+        let b: u32 = (0..16).fold(0u32, |acc, i| acc | ((rng.bool(0.5) as u32) << i));
+        assert_eq!(b, 0x3be8, "bool(0.5) stream (random_bool) changed");
+
+        let j: Vec<i64> = (0..4)
+            .map(|_| rng.jitter(Duration::from_millis(10)))
+            .collect();
+        assert_eq!(
+            j,
+            [3440136, 3642442, 3485106, -8003166],
+            "signed jitter stream (random_range over a signed range) changed"
+        );
+
+        let mut sh = [0u8, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+        rng.shuffle(&mut sh);
+        assert_eq!(
+            sh,
+            [4, 7, 9, 5, 3, 0, 8, 6, 1, 2],
+            "Fisher-Yates shuffle order changed"
+        );
+
+        // fork() derives the child seed via `fill()` — the surface most
+        // likely to shift on a rand major bump.
+        let mut child = SimRng::new(42).fork();
+        let c: Vec<u64> = (0..4).map(|_| child.u64(1_000_000)).collect();
+        assert_eq!(
+            c,
+            [999698, 281675, 181238, 337832],
+            "forked sub-stream changed (fill()-based seed derivation)"
+        );
     }
 
     #[test]

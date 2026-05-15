@@ -51,6 +51,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `if let` chains, which were stabilized in Rust 1.88.
 - crates.io metadata: `repository`, `homepage`, `documentation`, `keywords`,
   `categories`.
+- **Cross-version RNG-stream guardrail.** A test pins `SimRng`'s derived
+  stream for a fixed seed (the `rand`/`rand_chacha` distribution layer a
+  dependency bump could silently change). Any change to what a seed
+  produces now fails CI and must be deliberately re-blessed and noted
+  here — the integration determinism test only checks self-consistency
+  within one binary, so this closes that gap.
 
 ### Changed
 
@@ -64,6 +70,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Dijkstra scratch buffers (`dist`, `prev`, `heap`). Route cache backing
   switched from `HashMap<(NodeId, NodeId), Route>` to a dense
   `Vec<Option<Route>>` indexed by `src * node_count + dst`.
+- **Dependency upgrades:** `rand` 0.9 → 0.10, `rand_chacha` 0.9 → 0.10,
+  `criterion` 0.5 → 0.8 (dev-only). The `rand` 0.10 API moved the
+  sampling methods from `Rng` to a new `RngExt` trait; the only internal
+  change was the import. **This is stream-neutral:** the new
+  `SimRng`-stream guardrail test confirms every seed produces the exact
+  same `u64`/`f64`/`bool`/`jitter`/`shuffle`/`fork` sequence as on
+  `rand` 0.9, so no recorded trace or replay changes.
 
 ### Fixed
 

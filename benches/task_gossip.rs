@@ -4,7 +4,9 @@
 //! next neighbor up to `HOPS` times. Exercises the `TaskSim` poll/wake path
 //! plus message routing.
 
-use criterion::{BatchSize, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use std::hint::black_box;
+
+use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use simulacra::{Duration, NodeContext, NodeId, TaskSimBuilder, TopologyBuilder};
 
 fn bench_ring_gossip(c: &mut Criterion) {

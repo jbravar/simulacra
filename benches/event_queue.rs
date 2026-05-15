@@ -4,7 +4,9 @@
 //! the raw cost of scheduling and draining events, both under interleaved
 //! times and under identical times (worst case for tie-breaking).
 
-use criterion::{BatchSize, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use std::hint::black_box;
+
+use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use simulacra::{EventQueue, Time};
 
 fn bench_push_pop_interleaved(c: &mut Criterion) {

@@ -4,7 +4,9 @@
 //! topology of size N. Exercises `Network::send` path, routing cache,
 //! and event-queue drain.
 
-use criterion::{BatchSize, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use std::hint::black_box;
+
+use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use simulacra::{Duration, NetEvent, Network, NodeId, TopologyBuilder};
 
 fn bench_star_broadcast(c: &mut Criterion) {
