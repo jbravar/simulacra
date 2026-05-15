@@ -3,3 +3,6 @@
 
 # Assistants
 .claude/worktrees
+
+# Local
+*.local.*
