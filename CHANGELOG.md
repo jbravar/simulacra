@@ -5,10 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.1.0] - unreleased
+
+First release. Not yet published to crates.io.
 
 ### Added
 
+- Deterministic discrete-event simulation kernel: `Time`, `Duration`,
+  `Scheduled<E>`, `EventQueue`, `Simulation::run`.
+- Seeded ChaCha8 RNG (`SimRng`) with `fork()` for independent sub-streams.
+- Network domain: `NodeId`, `Topology` with adjacency-list routing and
+  Dijkstra shortest paths, `TopologyBuilder` with `ring` / `star` /
+  `full_mesh` / `line` / `link` / `link_asymmetric` patterns.
+- Latency models: `FixedLatency`, `UniformJitter`, `PercentageJitter`,
+  `OverheadPlusJitter`.
+- Pair-level `Network::partition` / `heal` for symmetric link failures
+  at the `(src, dst)` granularity.
+- Configurable `NetConfig::packet_loss` for random Bernoulli drops.
+- Trace recording via `TraceRecorder`, `TraceEvent`, `Trace::compare`,
+  and `Trace::validate_replay`.
+- `TracedNetwork<P, L>` wrapper for automatic trace capture, with
+  optional JSON export/import behind the `serde` feature flag.
+- Async task façade: `TaskSimBuilder`, `TaskSim`, `NodeContext` with
+  `sleep` / `recv` / `recv_timeout` / `send` futures, `Envelope`,
+  `select2`, `CancellationToken`. Custom no-op waker driven by the
+  event queue (no real Tokio runtime).
+- `Scenario<M>` convenience builder over `TaskSimBuilder`.
 - **End-to-end bandwidth model.** `Network::set_bandwidth` and `send_sized`
   apply per-`(src, dst)` serialization queueing on top of the latency
   model, and the underlying admission pass walks the path hop-by-hop.
@@ -85,31 +107,3 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   topology had no route between source and destination. They now drop
   and increment `TaskSimStats::messages_dropped`. Existing tests that
   asserted the old broken behavior have been updated.
-
-## [0.1.0] - 2026-04-16
-
-Initial release.
-
-- Deterministic discrete-event simulation kernel: `Time`, `Duration`,
-  `Scheduled<E>`, `EventQueue`, `Simulation::run`.
-- Seeded ChaCha8 RNG (`SimRng`) with `fork()` for independent sub-streams.
-- Network domain: `NodeId`, `Topology` with adjacency-list routing and
-  Dijkstra shortest paths, `TopologyBuilder` with `ring` / `star` /
-  `full_mesh` / `line` / `link` / `link_asymmetric` patterns.
-- Latency models: `FixedLatency`, `UniformJitter`, `PercentageJitter`,
-  `OverheadPlusJitter`.
-- Pair-level `Network::partition` / `heal` for symmetric link failures
-  at the `(src, dst)` granularity.
-- Configurable `NetConfig::packet_loss` for random Bernoulli drops.
-- Trace recording via `TraceRecorder`, `TraceEvent`, `Trace::compare`,
-  and `Trace::validate_replay`.
-- `TracedNetwork<P, L>` wrapper for automatic trace capture, with
-  optional JSON export/import behind the `serde` feature flag.
-- Async task façade: `TaskSimBuilder`, `TaskSim`, `NodeContext` with
-  `sleep` / `recv` / `recv_timeout` / `send` futures, `Envelope`,
-  `select2`, `CancellationToken`. Custom no-op waker driven by the
-  event queue (no real Tokio runtime).
-- `Scenario<M>` convenience builder over `TaskSimBuilder`.
-
-[Unreleased]: https://github.com/jbravar/simulacra/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/jbravar/simulacra/releases/tag/v0.1.0
