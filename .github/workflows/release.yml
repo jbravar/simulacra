@@ -52,7 +52,21 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: cargo publish
+      - name: cargo publish (skip if version already on crates.io)
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
-        run: cargo publish --locked
+        run: |
+          version="${GITHUB_REF#refs/tags/v}"
+          # crates.io returns 200 for an existing crate@version, 404 if
+          # not yet published. A User-Agent is required or it 403s.
+          # This makes a manual first publish + tag push idempotent:
+          # 0.1.0 published from a workstation, later 0.1.x cut by CI.
+          code=$(curl -sSL -o /dev/null -w '%{http_code}' \
+            -H 'User-Agent: simulacra-release-ci (https://github.com/jbravar/simulacra)' \
+            "https://crates.io/api/v1/crates/simulacra/${version}")
+          if [ "$code" = "200" ]; then
+            echo "simulacra ${version} is already on crates.io — skipping publish."
+          else
+            echo "simulacra ${version} not found (HTTP ${code}) — publishing."
+            cargo publish --locked
+          fi
