@@ -59,7 +59,11 @@ pub use rng::SimRng;
 pub use scenario::Scenario;
 pub use sim::{Simulation, SimulationStats};
 pub use time::{Duration, Time};
-pub use trace::{ReplayError, Trace, TraceEvent, TraceMismatch, TraceRecorder};
+#[cfg(feature = "serde")]
+pub use trace::TraceLoadError;
+pub use trace::{
+    ReplayError, TRACE_SCHEMA_VERSION, Trace, TraceEvent, TraceMismatch, TraceRecorder,
+};
 
 // Re-export commonly used network types at crate root for convenience
 pub use net::{

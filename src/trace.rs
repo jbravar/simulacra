@@ -15,6 +15,20 @@ use std::fmt;
 
 use crate::time::Time;
 
+/// Current serialized trace-schema version.
+///
+/// Embedded in every JSON trace. **Bump this on any change to the
+/// serialized shape** — the [`Trace`] envelope *or* the wire shape of a
+/// known event type. [`Trace::from_json`] / [`Trace::read_json`] reject
+/// traces whose version differs, so a bump is a deliberate, reviewable
+/// break (same discipline as the RNG-stream golden test).
+pub const TRACE_SCHEMA_VERSION: u32 = 1;
+
+/// Format tag written into every serialized trace so foreign or
+/// hand-rolled JSON is rejected with a clear error instead of being
+/// silently mis-parsed into a structurally-similar `Trace`.
+const TRACE_FORMAT: &str = "simulacra-trace";
+
 /// A recorded event in a trace.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -47,7 +61,6 @@ impl<E> TraceEvent<E> {
 ///
 /// Captures all events in processing order, along with metadata about the run.
 #[derive(Debug, Clone)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Trace<E> {
     /// Seed used for this simulation run.
     pub seed: u64,
@@ -114,45 +127,166 @@ impl<E> Trace<E> {
     }
 }
 
+/// Borrowed view serialized in place of `Trace`, so every emitted trace
+/// carries the format tag + schema version without those constants
+/// polluting the in-memory type or `compare()`.
+#[cfg(feature = "serde")]
+#[derive(serde::Serialize)]
+struct TraceEnvelopeRef<'a, E> {
+    format: &'static str,
+    schema_version: u32,
+    seed: u64,
+    events: &'a [TraceEvent<E>],
+    final_time_ns: u64,
+}
+
+/// Owned shape parsed on the way in, before validation. `format` /
+/// `schema_version` default so a foreign document yields a clear
+/// `NotASimulacraTrace` / `SchemaVersion` rather than a raw serde error.
+#[cfg(feature = "serde")]
+#[derive(serde::Deserialize)]
+struct TraceEnvelopeOwned<E> {
+    #[serde(default)]
+    format: String,
+    #[serde(default)]
+    schema_version: u32,
+    seed: u64,
+    events: Vec<TraceEvent<E>>,
+    final_time_ns: u64,
+}
+
+/// Error returned when a trace fails to load.
+///
+/// Loading is strict: a foreign document or a different schema version is
+/// a hard error, never a silent best-effort parse.
+#[cfg(feature = "serde")]
+#[derive(Debug)]
+pub enum TraceLoadError {
+    /// Not valid JSON, or did not match the trace shape.
+    Json(serde_json::Error),
+    /// I/O failure reading the trace file.
+    Io(std::io::Error),
+    /// Valid JSON, but not a Simulacra trace (missing/wrong format tag).
+    NotASimulacraTrace,
+    /// A Simulacra trace, but written by an incompatible schema version.
+    SchemaVersion { expected: u32, found: u32 },
+}
+
+#[cfg(feature = "serde")]
+impl fmt::Display for TraceLoadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TraceLoadError::Json(e) => write!(f, "invalid trace JSON: {e}"),
+            TraceLoadError::Io(e) => write!(f, "could not read trace file: {e}"),
+            TraceLoadError::NotASimulacraTrace => write!(
+                f,
+                "not a Simulacra trace (missing or wrong \"{TRACE_FORMAT}\" format tag)"
+            ),
+            TraceLoadError::SchemaVersion { expected, found } => write!(
+                f,
+                "unsupported trace schema version: file is v{found}, \
+                 this build expects v{expected}"
+            ),
+        }
+    }
+}
+
+#[cfg(feature = "serde")]
+impl std::error::Error for TraceLoadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            TraceLoadError::Json(e) => Some(e),
+            TraceLoadError::Io(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(feature = "serde")]
+impl From<serde_json::Error> for TraceLoadError {
+    fn from(e: serde_json::Error) -> Self {
+        TraceLoadError::Json(e)
+    }
+}
+
+#[cfg(feature = "serde")]
+impl From<std::io::Error> for TraceLoadError {
+    fn from(e: std::io::Error) -> Self {
+        TraceLoadError::Io(e)
+    }
+}
+
 #[cfg(feature = "serde")]
 impl<E: serde::Serialize> Trace<E> {
-    /// Exports the trace to a JSON string.
+    fn envelope(&self) -> TraceEnvelopeRef<'_, E> {
+        TraceEnvelopeRef {
+            format: TRACE_FORMAT,
+            schema_version: TRACE_SCHEMA_VERSION,
+            seed: self.seed,
+            events: &self.events,
+            final_time_ns: self.final_time_ns,
+        }
+    }
+
+    /// Exports the trace to a JSON string (format-tagged + versioned).
     pub fn to_json(&self) -> Result<String, serde_json::Error> {
-        serde_json::to_string(self)
+        serde_json::to_string(&self.envelope())
     }
 
     /// Exports the trace to a pretty-printed JSON string.
     pub fn to_json_pretty(&self) -> Result<String, serde_json::Error> {
-        serde_json::to_string_pretty(self)
+        serde_json::to_string_pretty(&self.envelope())
     }
 
     /// Writes the trace to a JSON file.
     pub fn write_json(&self, path: impl AsRef<std::path::Path>) -> std::io::Result<()> {
         let file = std::fs::File::create(path)?;
-        serde_json::to_writer(file, self)?;
+        serde_json::to_writer(file, &self.envelope())?;
         Ok(())
     }
 
     /// Writes the trace to a pretty-printed JSON file.
     pub fn write_json_pretty(&self, path: impl AsRef<std::path::Path>) -> std::io::Result<()> {
         let file = std::fs::File::create(path)?;
-        serde_json::to_writer_pretty(file, self)?;
+        serde_json::to_writer_pretty(file, &self.envelope())?;
         Ok(())
     }
 }
 
 #[cfg(feature = "serde")]
 impl<E: serde::de::DeserializeOwned> Trace<E> {
-    /// Parses a trace from a JSON string.
-    pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
-        serde_json::from_str(json)
+    fn from_envelope(env: TraceEnvelopeOwned<E>) -> Result<Self, TraceLoadError> {
+        if env.format != TRACE_FORMAT {
+            return Err(TraceLoadError::NotASimulacraTrace);
+        }
+        if env.schema_version != TRACE_SCHEMA_VERSION {
+            return Err(TraceLoadError::SchemaVersion {
+                expected: TRACE_SCHEMA_VERSION,
+                found: env.schema_version,
+            });
+        }
+        Ok(Trace {
+            seed: env.seed,
+            events: env.events,
+            final_time_ns: env.final_time_ns,
+        })
     }
 
-    /// Reads a trace from a JSON file.
-    pub fn read_json(path: impl AsRef<std::path::Path>) -> std::io::Result<Self> {
+    /// Parses a trace from a JSON string.
+    ///
+    /// Strict: rejects non-Simulacra JSON
+    /// ([`TraceLoadError::NotASimulacraTrace`]) and traces from a
+    /// different [`TRACE_SCHEMA_VERSION`]
+    /// ([`TraceLoadError::SchemaVersion`]) rather than mis-parsing them.
+    pub fn from_json(json: &str) -> Result<Self, TraceLoadError> {
+        Self::from_envelope(serde_json::from_str(json)?)
+    }
+
+    /// Reads a trace from a JSON file, with the same strict validation as
+    /// [`Trace::from_json`].
+    pub fn read_json(path: impl AsRef<std::path::Path>) -> Result<Self, TraceLoadError> {
         let file = std::fs::File::open(path)?;
-        let trace = serde_json::from_reader(file)?;
-        Ok(trace)
+        Self::from_envelope(serde_json::from_reader(file)?)
     }
 }
 
@@ -464,5 +598,49 @@ mod tests {
         let parsed: Trace<TestEvent> = Trace::from_json(&json).unwrap();
 
         assert!(trace.compare(&parsed).is_ok());
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn json_carries_format_tag_and_version() {
+        let mut trace = Trace::new(7);
+        trace.record(Time::from_millis(1), TestEvent::A(1));
+        let json = trace.to_json().unwrap();
+
+        assert!(json.contains(r#""format":"simulacra-trace""#));
+        assert!(json.contains(&format!(r#""schema_version":{TRACE_SCHEMA_VERSION}"#)));
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn from_json_rejects_foreign_document() {
+        // Structurally trace-like, but no format tag.
+        let foreign = r#"{"seed":1,"events":[],"final_time_ns":0}"#;
+        let err = Trace::<TestEvent>::from_json(foreign).unwrap_err();
+        assert!(matches!(err, TraceLoadError::NotASimulacraTrace));
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn from_json_rejects_other_schema_version() {
+        let future = format!(
+            r#"{{"format":"simulacra-trace","schema_version":{},"seed":1,"events":[],"final_time_ns":0}}"#,
+            TRACE_SCHEMA_VERSION + 1
+        );
+        let err = Trace::<TestEvent>::from_json(&future).unwrap_err();
+        match err {
+            TraceLoadError::SchemaVersion { expected, found } => {
+                assert_eq!(expected, TRACE_SCHEMA_VERSION);
+                assert_eq!(found, TRACE_SCHEMA_VERSION + 1);
+            }
+            other => panic!("expected SchemaVersion, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn from_json_rejects_garbage() {
+        let err = Trace::<TestEvent>::from_json("not json at all").unwrap_err();
+        assert!(matches!(err, TraceLoadError::Json(_)));
     }
 }

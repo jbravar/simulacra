@@ -79,8 +79,20 @@ First release. Not yet published to crates.io.
   produces now fails CI and must be deliberately re-blessed and noted
   here — the integration determinism test only checks self-consistency
   within one binary, so this closes that gap.
+- **Versioned, format-tagged trace schema.** Serialized traces now carry
+  a `format: "simulacra-trace"` tag and `schema_version` (exposed as
+  `TRACE_SCHEMA_VERSION`); bump the constant on any serialized-shape
+  change. New `TraceLoadError` (serde feature).
 
 ### Changed
+
+- **`Trace::from_json` / `read_json` are now strict.** They return
+  `Result<_, TraceLoadError>` instead of `serde_json::Error` /
+  `io::Result`, rejecting foreign JSON (`NotASimulacraTrace`) and
+  mismatched schema versions (`SchemaVersion`) rather than silently
+  mis-parsing. The serialized trace gained a `format` + `schema_version`
+  envelope (the in-memory `Trace` type is unchanged; `compare()` stays
+  purely semantic).
 
 - **Topology route cache is now lazy.** Construction and `add_link` are
   O(1) regardless of node count; the cache is allocated on the first
