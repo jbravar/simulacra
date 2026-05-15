@@ -1,1 +1,5 @@
+# Compiled
 /target
+
+# Assistants
+.claude/worktrees
