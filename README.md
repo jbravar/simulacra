@@ -5,7 +5,8 @@
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 A deterministic discrete-event simulation engine for modeling message flow across
-large computer networks, with pluggable latency, jitter, and failure models.
+large computer networks, with pluggable latency, jitter, failure, and
+bandwidth/congestion models.
 
 Simulacra gives you a Tokio-flavored async API on top of a small, inspectable
 simulation kernel: you write node logic with `sleep().await` / `recv().await` /
@@ -70,7 +71,7 @@ fn main() {
 ```
 
 See `examples/` for longer worked examples (gossip, leader election, retries
-over a lossy link).
+over a lossy link, failure injection, bandwidth saturation, WAN bottleneck).
 
 ## The determinism contract
 
@@ -117,12 +118,19 @@ under simulated conditions.
 
 ## Current status
 
-Version 0.1. The kernel and async facade are implemented and tested (74+ unit
-tests, deterministic replay validated end-to-end). Bandwidth/congestion modeling
-and parallel single-run execution are out of scope for v1.
+Version 0.1.0 — implemented and tested, but **not yet published to crates.io**.
+Alongside the deterministic kernel, async facade, and topology-aware delivery,
+0.1.0 ships full failure injection (link / node / partition with reroute), an
+end-to-end **bandwidth and congestion model** (per-link capacity, hop-by-hop
+serialization, buffer-overflow drops, and RED active queue management), the
+`SpikyLatency` model, and the `Scenario` builder. 140+ unit tests; deterministic
+JSON-trace replay is validated end-to-end in CI.
 
-See `DESIGN.md` for architecture and the long-term roadmap, and `AGENTS.md` for
-contributor guidelines.
+Parallel *single-run* execution remains out of scope; independent multi-seed
+runs are parallelized via `parallel::run_seeds`.
+
+See `DESIGN.md` for architecture and the roadmap, `CHANGELOG.md` for the full
+0.1.0 contents, and `AGENTS.md` for contributor guidelines.
 
 ## Development
 
@@ -132,7 +140,7 @@ cargo test               # run the full test suite
 cargo test --features serde   # include JSON trace tests
 cargo fmt -- --check     # formatting check
 cargo clippy --all-targets --all-features -- -D warnings
-cargo bench              # Criterion benchmarks (after Phase B lands)
+cargo bench              # Criterion benchmarks (see docs/perf-baseline.md)
 ```
 
 ## License
