@@ -26,6 +26,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exists, recording it at the failure time. Mirrors
   `NetConfig::drop_in_flight_on_failure`; off by default (in-flight messages
   survive).
+- **Failure-exercising benchmark** (`benches/failure_injection.rs`). Populates
+  ~10% of the failure surface so the Phase 7 hot paths (per-edge `failed_links`
+  probe in Dijkstra, `partitions` probe at send time) carry real cost and a
+  regression on them becomes visible — the existing empty-failure-set benches
+  could not show this. Baseline numbers in `docs/perf-baseline.md`.
 
 ### Changed
 

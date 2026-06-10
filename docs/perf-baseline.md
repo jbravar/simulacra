@@ -107,6 +107,27 @@ Criterion still flags the N=64 and N=256 deltas as within noise at
 firmer picture. Even on the high end of the noise band, all sizes
 remain comfortably ahead of the original baseline.
 
+### `failure/link_failure_broadcast` and `failure/partition_send`
+
+These deliberately populate the failure surface so the Phase 7 hot paths
+(per-edge `failed_links` probe in Dijkstra; `partitions` probe at send
+time) carry real cost. `link_failure_broadcast` fails ~10% of a full
+mesh's edges then broadcasts from the hub; `partition_send` partitions
+~10% of a star's hub→spoke pairs then broadcasts.
+
+| group / N                       | time (--quick, indicative) |
+| ------------------------------- | -------------------------- |
+| link_failure_broadcast, N=32    | ~1.31 µs                   |
+| link_failure_broadcast, N=128   | ~10.8 µs                   |
+| partition_send, N=32            | ~1.04 µs                   |
+| partition_send, N=256           | ~10.7 µs                   |
+
+Captured with `--quick` (low sample count), so treat as indicative, not
+firm — run `cargo bench --bench failure_injection` for tight intervals.
+The point of these benches is a *regression tripwire*: they make the
+non-empty `HashSet::contains` costs visible, which the empty-failure-set
+benches above cannot.
+
 ## Takeaways
 
 - Raw `EventQueue` throughput scales sub-linearly (n log n), as expected
@@ -125,9 +146,10 @@ remain comfortably ahead of the original baseline.
   allocation is measurable. Lazy init is a cheap follow-up if we care.
 - The Phase 7 failure-injection hot-path additions (HashSet checks per
   Dijkstra edge, partition check per SendFut::poll) are invisible on
-  workloads with empty failure sets. A future bench that *exercises*
-  partitions / fail_link / fail_node would show a different picture and
-  is a reasonable follow-up if we start using the API at scale.
+  workloads with empty failure sets — see the empty-set benches above.
+  The `failure/*` benches now exercise a populated failure surface (~10%)
+  so those `HashSet::contains` costs are no longer hidden and a future
+  regression on them will show up.
 
 ## Re-running
 
@@ -136,6 +158,7 @@ cargo bench                                # all benches, full sampling (~few mi
 cargo bench --bench event_queue -- --quick # fast smoke
 cargo bench --bench task_gossip -- --quick
 cargo bench --bench network_broadcast -- --quick
+cargo bench --bench failure_injection -- --quick
 ```
 
 Criterion writes HTML reports under `target/criterion/`. Use

@@ -426,12 +426,11 @@ If that works deterministically, the nucleus of the project is sound.
 
 Concrete next moves, ordered by rough effort, smallest first.
 
-1. **Failure-exercising bench.** All current benches have empty failure
-   sets, so the per-edge `HashSet::contains` in Dijkstra and the
-   partition check in `SendFut::poll` are invisible. Add a bench that
-   actually populates `failed_links` / `failed_nodes` / `partitions`
-   (e.g., 10% of edges failed) so future regressions on the failure
-   hot path become visible. Add a column to `docs/perf-baseline.md`.
+1. **Failure-exercising bench.** _Landed 2026-06-10._ `benches/failure_injection.rs`
+   populates ~10% of the failure surface (`link_failure_broadcast` fails mesh
+   edges; `partition_send` partitions star pairs) so the per-edge
+   `failed_links` probe in Dijkstra and the `partitions` probe at send time
+   carry real cost. Numbers recorded in `docs/perf-baseline.md`.
 2. **Task-layer trace export.** _Landed 2026-06-10._ `TaskSimBuilder::with_trace`
    plus `TaskSim::run_traced` / `run_until_traced` record `TaskTraceEvent`
    (`Delivered` / `Dropped { reason }`) into the existing `Trace<E>` envelope
