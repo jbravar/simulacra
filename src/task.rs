@@ -38,6 +38,7 @@ use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use crate::net::{NodeId, Topology};
 use crate::queue::EventQueue;
 use crate::time::{Duration, Time};
+use crate::trace::{Trace, TraceRecorder};
 
 /// Canonical ordering for an unordered node pair, used as the key for
 /// symmetric partition tracking. Mirrors the helper used in `net::mod`.
@@ -68,6 +69,94 @@ pub struct Envelope<M> {
     pub received_at: Time,
 }
 
+/// A simplified trace event for task-based simulations.
+///
+/// Mirrors [`crate::net::NetTraceEvent`] for the async task layer: it captures
+/// message deliveries and drops without requiring the payload `M` to be `Clone`
+/// or `Serialize`. Events are recorded only when the simulation is built with
+/// [`TaskSimBuilder::with_trace`] (or run via [`TaskSim::run_traced`] /
+/// [`TaskSim::run_until_traced`]), in the exact order they occur during the run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum TaskTraceEvent {
+    /// A message landed in the destination node's inbox.
+    Delivered {
+        /// Source node.
+        src: u32,
+        /// Destination node.
+        dst: u32,
+    },
+    /// A message was dropped instead of delivered.
+    Dropped {
+        /// Source node.
+        src: u32,
+        /// Destination node.
+        dst: u32,
+        /// Why the message was dropped.
+        reason: TaskTraceDropReason,
+    },
+}
+
+/// Why a task-layer message was dropped.
+///
+/// The async task facade drops a send when its destination is unreachable at
+/// send time. Unlike the [`Network`](crate::net::Network) layer, the task
+/// facade has no random packet loss or per-link buffers, so only these two
+/// reasons can occur.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum TaskTraceDropReason {
+    /// No route from source to destination — also covers a failed link or
+    /// node on the only path, since routing simply finds no path.
+    NoRoute,
+    /// An active partition blocks the source/destination pair.
+    Partitioned,
+}
+
+/// A topology or partition mutation that can be scheduled to fire at a fixed
+/// simulated time (see [`TaskSim::schedule_failure`] / [`Scenario::fail_at`]).
+///
+/// Each variant maps to the same-named imperative mutator on [`NodeContext`] /
+/// [`TaskSim`]; scheduling them turns the common "fail at T1, heal at T2"
+/// pattern into declarative data instead of hand-rolled `ctx.now()` checks.
+/// The failure-introducing variants honor
+/// [`TaskSimBuilder::drop_in_flight_on_failure`].
+///
+/// [`Scenario::fail_at`]: crate::Scenario::fail_at
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureAction {
+    /// Install a symmetric partition between two nodes.
+    Partition(NodeId, NodeId),
+    /// Remove a symmetric partition.
+    Heal(NodeId, NodeId),
+    /// Fail the bidirectional link between two nodes.
+    FailLink(NodeId, NodeId),
+    /// Restore a failed bidirectional link.
+    HealLink(NodeId, NodeId),
+    /// Fail a single direction of a link (`src -> dst`).
+    FailLinkDirected(NodeId, NodeId),
+    /// Restore a single direction of a link (`src -> dst`).
+    HealLinkDirected(NodeId, NodeId),
+    /// Fail a node (excluded from routing as src, dst, or hop).
+    FailNode(NodeId),
+    /// Restore a failed node.
+    HealNode(NodeId),
+}
+
+impl FailureAction {
+    /// Whether this action introduces a failure (and so can strand in-flight
+    /// messages), as opposed to healing one.
+    const fn is_failure(self) -> bool {
+        matches!(
+            self,
+            Self::Partition(..)
+                | Self::FailLink(..)
+                | Self::FailLinkDirected(..)
+                | Self::FailNode(..)
+        )
+    }
+}
+
 /// Internal events for the task simulation.
 #[derive(Debug)]
 enum TaskEvent<M> {
@@ -80,6 +169,8 @@ enum TaskEvent<M> {
         payload: M,
         sent_at: Time,
     },
+    /// Apply a scheduled topology/partition mutation at this time.
+    ApplyFailure(FailureAction),
 }
 
 /// Shared state for a node, accessible by its task.
@@ -113,11 +204,147 @@ struct SimState<M> {
     /// Running count of messages that were dropped (no route or
     /// partition) instead of delivered.
     messages_dropped: u64,
+    /// Optional trace recorder. `Some` once the sim has been built with
+    /// [`TaskSimBuilder::with_trace`] (or lazily enabled by
+    /// [`TaskSim::run_until_traced`]). A pure observer: it is read by nothing
+    /// in the engine, so recording cannot affect scheduling, RNG, or event
+    /// ordering, and therefore cannot affect determinism.
+    trace: Option<TraceRecorder<TaskTraceEvent>>,
+    /// When `true`, a failure mutator (`partition` / `fail_link` /
+    /// `fail_link_directed` / `fail_node`) sweeps the pending event queue and
+    /// drops any in-flight `Deliver` whose `(src, dst)` no longer routes,
+    /// recording it at the time of the failure. Mirrors
+    /// [`crate::net::NetConfig::drop_in_flight_on_failure`]. Defaults to
+    /// `false` (in-flight messages survive a mid-run failure).
+    drop_in_flight_on_failure: bool,
+}
+
+/// Sweeps `events`, removing every in-flight `Deliver` whose `(src, dst)` no
+/// longer routes under the current topology/partition state and returning the
+/// dropped pairs (with reason) so the caller can record them. Surviving
+/// `Deliver` and `Wake` events are kept at their original time (with fresh
+/// sequence numbers, per [`EventQueue::rewrite`]). A free function so it can
+/// borrow `events` and `topology` disjointly from the rest of `SimState`.
+fn sweep_in_flight_drops<M>(
+    events: &mut EventQueue<TaskEvent<M>>,
+    topology: &mut Topology,
+    partitions: &HashSet<(NodeId, NodeId)>,
+) -> Vec<(NodeId, NodeId, TaskTraceDropReason)> {
+    let mut dropped = Vec::new();
+    events.rewrite(|scheduled| match scheduled.event {
+        TaskEvent::Deliver {
+            src,
+            dst,
+            payload,
+            sent_at,
+        } => {
+            if partitions.contains(&pair_key(src, dst)) {
+                dropped.push((src, dst, TaskTraceDropReason::Partitioned));
+                None
+            } else if topology.route(src, dst).is_none() {
+                dropped.push((src, dst, TaskTraceDropReason::NoRoute));
+                None
+            } else {
+                Some((
+                    scheduled.time,
+                    TaskEvent::Deliver {
+                        src,
+                        dst,
+                        payload,
+                        sent_at,
+                    },
+                ))
+            }
+        }
+        keep @ (TaskEvent::Wake(_) | TaskEvent::ApplyFailure(_)) => Some((scheduled.time, keep)),
+    });
+    // Canonicalize the recorded-drop order by node pair so the trace does not
+    // depend on the heap's internal drain order.
+    dropped.sort_unstable_by_key(|&(src, dst, _)| (src.as_u32(), dst.as_u32()));
+    dropped
 }
 
 impl<M> SimState<M> {
     fn schedule_wake(&mut self, time: Time, task_id: TaskId) {
         self.events.schedule(time, TaskEvent::Wake(task_id));
+    }
+
+    /// If in-flight drop is enabled, sweep the event queue for `Deliver`
+    /// events whose route no longer exists and turn them into recorded drops
+    /// at the current time. Called from the failure mutators.
+    fn maybe_sweep_in_flight(&mut self) {
+        if !self.drop_in_flight_on_failure {
+            return;
+        }
+        let dropped = sweep_in_flight_drops(&mut self.events, &mut self.topology, &self.partitions);
+        for (src, dst, reason) in dropped {
+            #[expect(
+                clippy::arithmetic_side_effects,
+                reason = "monotonic u64 dropped-message counter; 2^64 drops is \
+                          physically unreachable in a simulation run"
+            )]
+            {
+                self.messages_dropped += 1;
+            }
+            self.record_drop(src, dst, reason);
+        }
+    }
+
+    /// Records a delivery into the optional trace recorder, at the current
+    /// simulated time. No-op when tracing is disabled.
+    fn record_delivered(&mut self, src: NodeId, dst: NodeId) {
+        if let Some(recorder) = self.trace.as_mut() {
+            recorder.record(
+                self.now,
+                TaskTraceEvent::Delivered {
+                    src: src.as_u32(),
+                    dst: dst.as_u32(),
+                },
+            );
+        }
+    }
+
+    /// Records a drop into the optional trace recorder, at the current
+    /// simulated time. No-op when tracing is disabled.
+    fn record_drop(&mut self, src: NodeId, dst: NodeId, reason: TaskTraceDropReason) {
+        if let Some(recorder) = self.trace.as_mut() {
+            recorder.record(
+                self.now,
+                TaskTraceEvent::Dropped {
+                    src: src.as_u32(),
+                    dst: dst.as_u32(),
+                    reason,
+                },
+            );
+        }
+    }
+
+    /// Applies a scheduled [`FailureAction`] to the topology / partition state,
+    /// then sweeps in-flight messages if it introduced a failure. Invoked when
+    /// an `ApplyFailure` event is processed.
+    fn apply_failure(&mut self, action: FailureAction) {
+        match action {
+            FailureAction::Partition(a, b) => {
+                self.partitions.insert(pair_key(a, b));
+            }
+            FailureAction::Heal(a, b) => {
+                self.partitions.remove(&pair_key(a, b));
+            }
+            FailureAction::FailLink(a, b) => self.topology.fail_link(a, b),
+            FailureAction::HealLink(a, b) => self.topology.heal_link(a, b),
+            FailureAction::FailLinkDirected(src, dst) => {
+                self.topology.fail_link_directed(src, dst);
+            }
+            FailureAction::HealLinkDirected(src, dst) => {
+                self.topology.heal_link_directed(src, dst);
+            }
+            FailureAction::FailNode(node) => self.topology.fail_node(node),
+            FailureAction::HealNode(node) => self.topology.heal_node(node),
+        }
+        // Only failures can strand in-flight messages; heals never do.
+        if action.is_failure() {
+            self.maybe_sweep_in_flight();
+        }
     }
 }
 
@@ -188,9 +415,12 @@ impl<M: 'static> NodeContext<M> {
     /// Installs a symmetric partition between `a` and `b`. Subsequent
     /// `send` calls across this pair (in either direction) will be dropped
     /// silently, with the run's `messages_dropped` counter incremented.
-    /// In-flight messages already scheduled for delivery are not affected.
+    /// In-flight messages already scheduled for delivery survive unless the
+    /// sim was built with [`TaskSimBuilder::drop_in_flight_on_failure`].
     pub fn partition(&self, a: NodeId, b: NodeId) {
-        self.state.borrow_mut().partitions.insert(pair_key(a, b));
+        let mut state = self.state.borrow_mut();
+        state.partitions.insert(pair_key(a, b));
+        state.maybe_sweep_in_flight();
     }
 
     /// Removes a previously-installed partition between `a` and `b`.
@@ -206,10 +436,14 @@ impl<M: 'static> NodeContext<M> {
 
     /// Fails the bidirectional link between `a` and `b` at the topology
     /// level. Sends whose route required this link will reroute (if an
-    /// alternative exists) or drop. In-flight messages already scheduled
-    /// for delivery are not affected.
+    /// alternative exists) or drop. In-flight messages already scheduled for
+    /// delivery survive unless the sim was built with
+    /// [`TaskSimBuilder::drop_in_flight_on_failure`] (in which case any whose
+    /// route no longer exists are dropped).
     pub fn fail_link(&self, a: NodeId, b: NodeId) {
-        self.state.borrow_mut().topology.fail_link(a, b);
+        let mut state = self.state.borrow_mut();
+        state.topology.fail_link(a, b);
+        state.maybe_sweep_in_flight();
     }
 
     /// Restores a previously-failed bidirectional link between `a` and `b`.
@@ -224,12 +458,12 @@ impl<M: 'static> NodeContext<M> {
         self.state.borrow().topology.is_link_failed(a, b)
     }
 
-    /// Fails a single direction of the link between `src` and `dst`.
+    /// Fails a single direction of the link between `src` and `dst`. Honors
+    /// [`TaskSimBuilder::drop_in_flight_on_failure`] for in-flight messages.
     pub fn fail_link_directed(&self, src: NodeId, dst: NodeId) {
-        self.state
-            .borrow_mut()
-            .topology
-            .fail_link_directed(src, dst);
+        let mut state = self.state.borrow_mut();
+        state.topology.fail_link_directed(src, dst);
+        state.maybe_sweep_in_flight();
     }
 
     /// Restores a single direction of the link between `src` and `dst`.
@@ -250,8 +484,12 @@ impl<M: 'static> NodeContext<M> {
     }
 
     /// Marks `node` as failed; routing excludes it as src, dst, or hop.
+    /// Honors [`TaskSimBuilder::drop_in_flight_on_failure`] for in-flight
+    /// messages.
     pub fn fail_node(&self, node: NodeId) {
-        self.state.borrow_mut().topology.fail_node(node);
+        let mut state = self.state.borrow_mut();
+        state.topology.fail_node(node);
+        state.maybe_sweep_in_flight();
     }
 
     /// Restores a previously-failed node.
@@ -477,6 +715,7 @@ impl<M: Clone + 'static> Future for SendFut<M> {
                 {
                     state.messages_dropped += 1;
                 }
+                state.record_drop(this.src, this.dst, TaskTraceDropReason::Partitioned);
                 return Poll::Ready(());
             }
 
@@ -489,6 +728,7 @@ impl<M: Clone + 'static> Future for SendFut<M> {
                 {
                     state.messages_dropped += 1;
                 }
+                state.record_drop(this.src, this.dst, TaskTraceDropReason::NoRoute);
                 return Poll::Ready(());
             };
 
@@ -603,6 +843,8 @@ fn create_waker() -> Waker {
 pub struct TaskSimBuilder<M: 'static> {
     topology: Topology,
     seed: u64,
+    trace_enabled: bool,
+    drop_in_flight_on_failure: bool,
     _phantom: std::marker::PhantomData<M>,
 }
 
@@ -613,8 +855,44 @@ impl<M: 'static> TaskSimBuilder<M> {
         Self {
             topology,
             seed,
+            trace_enabled: false,
+            drop_in_flight_on_failure: false,
             _phantom: std::marker::PhantomData,
         }
+    }
+
+    /// Drops in-flight messages when a failure strands them.
+    ///
+    /// By default, a mid-run `partition` / `fail_link` / `fail_node` only
+    /// affects *future* sends; messages already scheduled for delivery still
+    /// arrive. With this set, those failure mutators also sweep the pending
+    /// event queue and drop any in-flight message whose `(src, dst)` no longer
+    /// routes, counting it in `messages_dropped` (and recording a `Dropped`
+    /// trace event when tracing is enabled) at the time of the failure.
+    ///
+    /// Mirrors [`crate::net::NetConfig::drop_in_flight_on_failure`] for the
+    /// async task layer.
+    #[must_use]
+    pub const fn drop_in_flight_on_failure(mut self) -> Self {
+        self.drop_in_flight_on_failure = true;
+        self
+    }
+
+    /// Enables trace recording for the built simulation.
+    ///
+    /// When set, the [`TaskSim`] records a [`TaskTraceEvent`] for every
+    /// delivery and drop — including drops from [`TaskSim::inject`] calls made
+    /// before the run — retrievable via [`TaskSim::run_traced`] /
+    /// [`TaskSim::run_until_traced`]. Without it, those run methods still
+    /// produce a trace, but any injection-time drops that happened before the
+    /// run are not captured.
+    ///
+    /// The recorded trace is only returned by the `*_traced` run methods; a
+    /// plain [`TaskSim::run`] / [`TaskSim::run_until`] discards it.
+    #[must_use]
+    pub const fn with_trace(mut self) -> Self {
+        self.trace_enabled = true;
+        self
     }
 
     /// Builds the simulation with the given node function.
@@ -652,6 +930,12 @@ impl<M: 'static> TaskSimBuilder<M> {
             cancelled: Rc::new(Cell::new(false)),
             partitions: HashSet::new(),
             messages_dropped: 0,
+            trace: if self.trace_enabled {
+                Some(TraceRecorder::new(self.seed))
+            } else {
+                None
+            },
+            drop_in_flight_on_failure: self.drop_in_flight_on_failure,
         }));
 
         // Create tasks for each node
@@ -752,6 +1036,7 @@ impl<M: Clone + 'static> TaskSim<M> {
             {
                 state.messages_dropped += 1;
             }
+            state.record_drop(src, dst, TaskTraceDropReason::Partitioned);
             return;
         }
 
@@ -764,6 +1049,7 @@ impl<M: Clone + 'static> TaskSim<M> {
             {
                 state.messages_dropped += 1;
             }
+            state.record_drop(src, dst, TaskTraceDropReason::NoRoute);
             return;
         };
 
@@ -784,6 +1070,21 @@ impl<M: Clone + 'static> TaskSim<M> {
         );
     }
 
+    /// Schedules a [`FailureAction`] to be applied at simulated time `time`.
+    ///
+    /// When the event fires, the topology / partition mutation is applied (and
+    /// in-flight messages are swept if it is a failure and
+    /// [`TaskSimBuilder::drop_in_flight_on_failure`] is set). This is the
+    /// declarative alternative to a node task polling `ctx.now()` to drive
+    /// failures by hand; [`Scenario::fail_at`](crate::Scenario::fail_at) wraps
+    /// it.
+    pub fn schedule_failure(&mut self, time: Time, action: FailureAction) {
+        self.state
+            .borrow_mut()
+            .events
+            .schedule(time, TaskEvent::ApplyFailure(action));
+    }
+
     /// Returns the seed used for this simulation.
     #[must_use]
     pub const fn seed(&self) -> u64 {
@@ -793,7 +1094,9 @@ impl<M: Clone + 'static> TaskSim<M> {
     /// Installs a symmetric partition between `a` and `b`. See
     /// [`NodeContext::partition`].
     pub fn partition(&mut self, a: NodeId, b: NodeId) {
-        self.state.borrow_mut().partitions.insert(pair_key(a, b));
+        let mut state = self.state.borrow_mut();
+        state.partitions.insert(pair_key(a, b));
+        state.maybe_sweep_in_flight();
     }
 
     /// Removes a previously-installed partition.
@@ -807,9 +1110,12 @@ impl<M: Clone + 'static> TaskSim<M> {
         self.state.borrow().partitions.contains(&pair_key(a, b))
     }
 
-    /// Fails the bidirectional link between `a` and `b`.
+    /// Fails the bidirectional link between `a` and `b`. See
+    /// [`NodeContext::fail_link`].
     pub fn fail_link(&mut self, a: NodeId, b: NodeId) {
-        self.state.borrow_mut().topology.fail_link(a, b);
+        let mut state = self.state.borrow_mut();
+        state.topology.fail_link(a, b);
+        state.maybe_sweep_in_flight();
     }
 
     /// Restores a previously-failed bidirectional link.
@@ -824,12 +1130,12 @@ impl<M: Clone + 'static> TaskSim<M> {
         self.state.borrow().topology.is_link_failed(a, b)
     }
 
-    /// Fails a single direction of the link between `src` and `dst`.
+    /// Fails a single direction of the link between `src` and `dst`. See
+    /// [`NodeContext::fail_link_directed`].
     pub fn fail_link_directed(&mut self, src: NodeId, dst: NodeId) {
-        self.state
-            .borrow_mut()
-            .topology
-            .fail_link_directed(src, dst);
+        let mut state = self.state.borrow_mut();
+        state.topology.fail_link_directed(src, dst);
+        state.maybe_sweep_in_flight();
     }
 
     /// Restores a single direction of the link between `src` and `dst`.
@@ -849,9 +1155,11 @@ impl<M: Clone + 'static> TaskSim<M> {
             .is_link_failed_directed(src, dst)
     }
 
-    /// Marks `node` as failed.
+    /// Marks `node` as failed. See [`NodeContext::fail_node`].
     pub fn fail_node(&mut self, node: NodeId) {
-        self.state.borrow_mut().topology.fail_node(node);
+        let mut state = self.state.borrow_mut();
+        state.topology.fail_node(node);
+        state.maybe_sweep_in_flight();
     }
 
     /// Restores a previously-failed node.
@@ -964,6 +1272,9 @@ impl<M: Clone + 'static> TaskSim<M> {
                         let mut state = self.state.borrow_mut();
                         state.ready_tasks.push(task_id);
                     }
+                    TaskEvent::ApplyFailure(action) => {
+                        self.state.borrow_mut().apply_failure(action);
+                    }
                     TaskEvent::Deliver {
                         src,
                         dst,
@@ -996,14 +1307,20 @@ impl<M: Clone + 'static> TaskSim<M> {
                                     state.ready_tasks.push(task_id);
                                 }
                             }
-                        }
-                        #[expect(
-                            clippy::arithmetic_side_effects,
-                            reason = "monotonic u64 delivered-message counter; 2^64 \
-                                      deliveries is physically unreachable"
-                        )]
-                        {
-                            run_stats.messages_delivered += 1;
+                            // Count and record only deliveries that actually
+                            // reach an inbox, so `messages_delivered` stays equal
+                            // to the number of `Delivered` trace events. An
+                            // out-of-range `dst` (reachable only via a degenerate
+                            // out-of-bounds self-inject) is a true no-op here.
+                            #[expect(
+                                clippy::arithmetic_side_effects,
+                                reason = "monotonic u64 delivered-message counter; 2^64 \
+                                          deliveries is physically unreachable"
+                            )]
+                            {
+                                run_stats.messages_delivered += 1;
+                            }
+                            state.record_delivered(src, dst);
                         }
                     }
                 }
@@ -1020,6 +1337,52 @@ impl<M: Clone + 'static> TaskSim<M> {
         run_stats.final_time = state.now;
         run_stats.messages_dropped = state.messages_dropped;
         run_stats
+    }
+
+    /// Runs the simulation to completion, returning both the run stats and a
+    /// recorded [`Trace`] of every delivery and drop.
+    ///
+    /// Equivalent to [`Self::run`] plus trace capture. For a trace that also
+    /// includes drops from pre-run [`Self::inject`] calls, build the sim with
+    /// [`TaskSimBuilder::with_trace`] before injecting; otherwise tracing is
+    /// enabled here and only events from the run itself are captured.
+    #[must_use]
+    pub fn run_traced(self) -> (TaskSimStats, Trace<TaskTraceEvent>) {
+        self.run_until_traced(|_| true)
+    }
+
+    /// Like [`Self::run_until`], but also returns a recorded [`Trace`] of
+    /// every delivery and drop. See [`Self::run_traced`] for the note on
+    /// capturing injection-time drops.
+    #[must_use]
+    pub fn run_until_traced<F>(self, continue_fn: F) -> (TaskSimStats, Trace<TaskTraceEvent>)
+    where
+        F: FnMut(Time) -> bool,
+    {
+        let state = Rc::clone(&self.state);
+        let seed = self.seed;
+        // Ensure a recorder exists even if the builder did not enable one, so
+        // run-time events are always captured.
+        {
+            let mut s = state.borrow_mut();
+            if s.trace.is_none() {
+                s.trace = Some(TraceRecorder::new(seed));
+            }
+        }
+
+        // Named `run_stats` (not `stats`) to stay clear of the `state` binding
+        // above — matching the convention inside `run_until`.
+        let run_stats = self.run_until(continue_fn);
+
+        // The recorder is `Some` here (enabled above or at build); the
+        // `Trace::new` fallback is unreachable but keeps this off `unwrap`.
+        let mut trace = state
+            .borrow_mut()
+            .trace
+            .take()
+            .map_or_else(|| Trace::new(seed), TraceRecorder::finish);
+        trace.final_time_ns = run_stats.final_time.as_nanos();
+        (run_stats, trace)
     }
 }
 
@@ -1511,5 +1874,278 @@ mod tests {
         let stats = sim.run();
         assert_eq!(stats.tasks_completed, 2);
         assert_eq!(stats.messages_delivered, 0);
+    }
+
+    #[test]
+    fn traced_run_records_delivery() {
+        let topology = TopologyBuilder::new(2)
+            .link(0u32, 1u32, Duration::from_millis(10))
+            .build();
+
+        let sim = TaskSimBuilder::<u64>::new(topology, 7)
+            .with_trace()
+            .build(|ctx| async move {
+                if ctx.id() == NodeId(0) {
+                    ctx.send(NodeId(1), 42).await;
+                }
+            });
+
+        let (stats, trace) = sim.run_traced();
+
+        assert_eq!(stats.messages_delivered, 1);
+        assert_eq!(trace.seed, 7);
+        assert_eq!(trace.len(), 1);
+        assert_eq!(
+            trace.get(0).map(|e| e.event.clone()),
+            Some(TaskTraceEvent::Delivered { src: 0, dst: 1 })
+        );
+    }
+
+    #[test]
+    fn traced_run_records_noroute_drop() {
+        // No links: the send from node 0 has no route and is recorded as a
+        // drop rather than a delivery.
+        let topology = TopologyBuilder::new(2).build();
+
+        let sim = TaskSimBuilder::<u64>::new(topology, 1)
+            .with_trace()
+            .build(|ctx| async move {
+                if ctx.id() == NodeId(0) {
+                    ctx.send(NodeId(1), 1).await;
+                }
+            });
+
+        let (stats, trace) = sim.run_traced();
+
+        assert_eq!(stats.messages_delivered, 0);
+        assert_eq!(stats.messages_dropped, 1);
+        assert_eq!(trace.len(), 1);
+        assert_eq!(
+            trace.get(0).map(|e| e.event.clone()),
+            Some(TaskTraceEvent::Dropped {
+                src: 0,
+                dst: 1,
+                reason: TaskTraceDropReason::NoRoute,
+            })
+        );
+    }
+
+    #[test]
+    fn traced_inject_drop_is_recorded() {
+        // A pre-run inject to an unreachable node drops; because tracing was
+        // enabled (with_trace) before the inject, that drop is captured.
+        let topology = TopologyBuilder::new(2).build();
+
+        let mut sim = TaskSimBuilder::<u64>::new(topology, 1)
+            .with_trace()
+            .build(|_ctx| async move {});
+
+        sim.inject(NodeId(0), NodeId(1), 99);
+        let (stats, trace) = sim.run_traced();
+
+        assert_eq!(stats.messages_dropped, 1);
+        assert_eq!(trace.len(), 1);
+        assert!(matches!(
+            trace.get(0).map(|e| &e.event),
+            Some(TaskTraceEvent::Dropped {
+                reason: TaskTraceDropReason::NoRoute,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn tracing_does_not_change_behavior() {
+        // The recorder is a pure observer: a traced run and an untraced run of
+        // the same scenario must produce identical stats. (The trace itself
+        // being deterministic across runs is covered in tests/determinism.rs.)
+        fn scenario(trace: bool) -> TaskSimStats {
+            let topology = TopologyBuilder::new(3)
+                .link(0u32, 1u32, Duration::from_millis(5))
+                .link(1u32, 2u32, Duration::from_millis(5))
+                .build();
+            let builder = TaskSimBuilder::<u64>::new(topology, 99);
+            let builder = if trace { builder.with_trace() } else { builder };
+            let sim = builder.build(|ctx| async move {
+                if ctx.id() == NodeId(0) {
+                    ctx.send(NodeId(2), 1).await;
+                    ctx.sleep(Duration::from_millis(3)).await;
+                    ctx.send(NodeId(2), 2).await;
+                }
+            });
+            sim.run()
+        }
+
+        let untraced = scenario(false);
+        let traced = scenario(true);
+        assert_eq!(untraced.messages_delivered, traced.messages_delivered);
+        assert_eq!(untraced.messages_dropped, traced.messages_dropped);
+        assert_eq!(untraced.events_processed, traced.events_processed);
+        assert_eq!(untraced.task_polls, traced.task_polls);
+        assert_eq!(untraced.tasks_completed, traced.tasks_completed);
+        assert_eq!(untraced.final_time, traced.final_time);
+    }
+
+    #[test]
+    fn drop_in_flight_off_preserves_pending_delivery() {
+        // Default: a mid-run partition does not touch an already-scheduled
+        // delivery; the message still arrives.
+        let topology = TopologyBuilder::new(3)
+            .link(0u32, 1u32, Duration::from_millis(50))
+            .link(1u32, 2u32, Duration::from_millis(50))
+            .build();
+        let sim = TaskSimBuilder::<u64>::new(topology, 1).build(|ctx| async move {
+            if ctx.id() == NodeId(0) {
+                ctx.send(NodeId(2), 7).await; // delivery scheduled at ~100ms
+                ctx.sleep(Duration::from_millis(20)).await;
+                ctx.partition(NodeId(0), NodeId(2)); // flag off: no sweep
+            }
+        });
+        let stats = sim.run();
+        assert_eq!(stats.messages_delivered, 1);
+        assert_eq!(stats.messages_dropped, 0);
+    }
+
+    #[test]
+    fn drop_in_flight_partition_drops_pending_delivery() {
+        let topology = TopologyBuilder::new(3)
+            .link(0u32, 1u32, Duration::from_millis(50))
+            .link(1u32, 2u32, Duration::from_millis(50))
+            .build();
+        let sim = TaskSimBuilder::<u64>::new(topology, 1)
+            .drop_in_flight_on_failure()
+            .build(|ctx| async move {
+                if ctx.id() == NodeId(0) {
+                    ctx.send(NodeId(2), 7).await;
+                    ctx.sleep(Duration::from_millis(20)).await;
+                    ctx.partition(NodeId(0), NodeId(2)); // sweeps the in-flight deliver
+                }
+            });
+        let stats = sim.run();
+        assert_eq!(stats.messages_delivered, 0);
+        assert_eq!(stats.messages_dropped, 1);
+    }
+
+    #[test]
+    fn drop_in_flight_link_failure_drops_when_no_alternate() {
+        // Line topology: failing 0-1 leaves no route 0->2, so the in-flight
+        // message is dropped.
+        let topology = TopologyBuilder::new(3)
+            .link(0u32, 1u32, Duration::from_millis(50))
+            .link(1u32, 2u32, Duration::from_millis(50))
+            .build();
+        let sim = TaskSimBuilder::<u64>::new(topology, 1)
+            .drop_in_flight_on_failure()
+            .build(|ctx| async move {
+                if ctx.id() == NodeId(0) {
+                    ctx.send(NodeId(2), 7).await;
+                    ctx.sleep(Duration::from_millis(20)).await;
+                    ctx.fail_link(NodeId(0), NodeId(1));
+                }
+            });
+        let stats = sim.run();
+        assert_eq!(stats.messages_delivered, 0);
+        assert_eq!(stats.messages_dropped, 1);
+    }
+
+    #[test]
+    fn drop_in_flight_preserves_when_alternate_route_exists() {
+        // Triangle: failing 0-1 still leaves the direct 0-2 edge, so an
+        // in-flight message survives (at its original delivery time — the
+        // sweep drops only messages with no remaining route, it does not
+        // reroute).
+        let topology = TopologyBuilder::new(3)
+            .link(0u32, 1u32, Duration::from_millis(5))
+            .link(1u32, 2u32, Duration::from_millis(5))
+            .link(0u32, 2u32, Duration::from_millis(50))
+            .build();
+        let sim = TaskSimBuilder::<u64>::new(topology, 1)
+            .drop_in_flight_on_failure()
+            .build(|ctx| async move {
+                if ctx.id() == NodeId(0) {
+                    ctx.send(NodeId(2), 7).await; // via fast 0-1-2 (10ms)
+                    ctx.sleep(Duration::from_millis(2)).await;
+                    ctx.fail_link(NodeId(0), NodeId(1)); // 0->2 still routes via direct edge
+                }
+            });
+        let stats = sim.run();
+        assert_eq!(stats.messages_delivered, 1);
+        assert_eq!(stats.messages_dropped, 0);
+    }
+
+    #[test]
+    fn scheduled_failure_applies_at_its_time() {
+        // Two FailLink actions scheduled at t=10ms cut node 0 off. Node 0
+        // sleeps past that, then sends — the send must find no route and drop.
+        let topology = TopologyBuilder::new(3)
+            .link(0u32, 1u32, Duration::from_millis(5))
+            .link(1u32, 2u32, Duration::from_millis(5))
+            .link(0u32, 2u32, Duration::from_millis(50))
+            .build();
+        let mut sim = TaskSimBuilder::<u64>::new(topology, 1).build(|ctx| async move {
+            if ctx.id() == NodeId(0) {
+                ctx.sleep(Duration::from_millis(20)).await;
+                ctx.send(NodeId(2), 1).await;
+            }
+        });
+        sim.schedule_failure(
+            Time::from_millis(10),
+            FailureAction::FailLink(NodeId(0), NodeId(1)),
+        );
+        sim.schedule_failure(
+            Time::from_millis(10),
+            FailureAction::FailLink(NodeId(0), NodeId(2)),
+        );
+        let stats = sim.run();
+        assert_eq!(stats.messages_delivered, 0);
+        assert_eq!(stats.messages_dropped, 1);
+    }
+
+    #[test]
+    fn scheduled_failure_heal_restores_route() {
+        // Fail at t=10, heal at t=40. A send at t=50 must route again.
+        let topology = TopologyBuilder::new(3)
+            .link(0u32, 1u32, Duration::from_millis(5))
+            .link(1u32, 2u32, Duration::from_millis(5))
+            .build();
+        let mut sim = TaskSimBuilder::<u64>::new(topology, 1).build(|ctx| async move {
+            if ctx.id() == NodeId(0) {
+                ctx.sleep(Duration::from_millis(50)).await;
+                ctx.send(NodeId(2), 1).await;
+            }
+        });
+        sim.schedule_failure(
+            Time::from_millis(10),
+            FailureAction::FailLink(NodeId(0), NodeId(1)),
+        );
+        sim.schedule_failure(
+            Time::from_millis(40),
+            FailureAction::HealLink(NodeId(0), NodeId(1)),
+        );
+        let stats = sim.run();
+        assert_eq!(stats.messages_delivered, 1);
+        assert_eq!(stats.messages_dropped, 0);
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn task_trace_json_round_trip() {
+        let topology = TopologyBuilder::new(2)
+            .link(0u32, 1u32, Duration::from_millis(10))
+            .build();
+
+        let sim = TaskSimBuilder::<u64>::new(topology, 7)
+            .with_trace()
+            .build(|ctx| async move {
+                if ctx.id() == NodeId(0) {
+                    ctx.send(NodeId(1), 42).await;
+                }
+            });
+
+        let (_stats, trace) = sim.run_traced();
+
+        let json = trace.to_json().unwrap();
+        let parsed: Trace<TaskTraceEvent> = Trace::from_json(&json).unwrap();
+        trace.compare(&parsed).unwrap();
     }
 }

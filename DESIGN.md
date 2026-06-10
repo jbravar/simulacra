@@ -426,29 +426,36 @@ If that works deterministically, the nucleus of the project is sound.
 
 Concrete next moves, ordered by rough effort, smallest first.
 
-1. **Failure-exercising bench.** All current benches have empty failure
-   sets, so the per-edge `HashSet::contains` in Dijkstra and the
-   partition check in `SendFut::poll` are invisible. Add a bench that
-   actually populates `failed_links` / `failed_nodes` / `partitions`
-   (e.g., 10% of edges failed) so future regressions on the failure
-   hot path become visible. Add a column to `docs/perf-baseline.md`.
-2. **Task-layer trace export.** `TaskSim` has its own `SimState` and
-   `EventQueue<TaskEvent<M>>`, separate from `Network`'s
-   `TracedNetwork`. Determinism tests today only cover the `Network`
-   path. Add a `TracedTaskSim<M>` (or `TaskSimBuilder::with_trace`)
-   that records `Delivered` / `Dropped` events with timestamps, then
-   add a task-layer scenario to `tests/determinism.rs`.
-3. **Time-bounded failure scheduler helper.** A common pattern is
-   "fail at T1, heal at T2." Today users implement it inline by
-   checking `ctx.now()` on each handler tick (see
-   `examples/failure_injection.rs`). A small helper —
-   `Scenario::fail_at(time, action)` or similar — would dedupe that
-   pattern.
-4. **In-flight drop in the async task layer.** `Network` has the opt-in
-   `NetConfig::drop_in_flight_on_failure`; `TaskSim` does not. Symmetry
-   would mean adding the same flag to `TaskSimBuilder` / `TaskSim` and
-   sweeping `events: EventQueue<TaskEvent<M>>` on failure mutators.
-   Mostly mechanical given the existing `EventQueue::rewrite` primitive.
+1. **Failure-exercising bench.** _Landed 2026-06-10._ `benches/failure_injection.rs`
+   populates ~10% of the failure surface (`link_failure_broadcast` fails mesh
+   edges; `partition_send` partitions star pairs) so the per-edge
+   `failed_links` probe in Dijkstra and the `partitions` probe at send time
+   carry real cost. Numbers recorded in `docs/perf-baseline.md`.
+2. **Task-layer trace export.** _Landed 2026-06-10._ `TaskSimBuilder::with_trace`
+   plus `TaskSim::run_traced` / `run_until_traced` record `TaskTraceEvent`
+   (`Delivered` / `Dropped { reason }`) into the existing `Trace<E>` envelope
+   (no schema bump). The recorder is an `Option<TraceRecorder>` inside
+   `SimState` — a pure observer, asserted behavior-neutral by
+   `tracing_does_not_change_behavior`. `tests/determinism.rs` gained a
+   task-layer scenario (`task_scenario_*`) that is byte-equal across runs.
+   The drop reasons are only `NoRoute` / `Partitioned` — the task layer has no
+   packet loss or per-link buffers (that arrives with the congestion bridge).
+3. **Time-bounded failure scheduler helper.** _Landed 2026-06-10._
+   `Scenario::fail_at(time, FailureAction)` (and the lower-level
+   `TaskSim::schedule_failure`) replace the hand-rolled "check `ctx.now()`
+   each tick" pattern. Failures are first-class scheduled events: a new
+   `TaskEvent::ApplyFailure(FailureAction)` variant is applied by the run loop
+   at its time and composes with `drop_in_flight_on_failure`. `FailureAction`
+   covers partition/link/node fail + heal variants.
+4. **In-flight drop in the async task layer.** _Landed 2026-06-10._
+   `TaskSimBuilder::drop_in_flight_on_failure()` mirrors
+   `NetConfig::drop_in_flight_on_failure`: the failure mutators (on both
+   `NodeContext` and `TaskSim`) sweep `events: EventQueue<TaskEvent<M>>` via
+   `EventQueue::rewrite` and drop any pending `Deliver` whose `(src, dst)` no
+   longer routes. The task layer removes the event and records the drop
+   synchronously (it has no in-queue `Drop` event), and the sweep is eager
+   (task mutations are always synchronous — no deferred-flag step like
+   `Network::run`).
 5. **Queueing disciplines beyond FIFO.** Per-link bandwidth + buffer +
    tail/RED drop is in. Missing: priority queues, weighted fair
    queueing (WFQ), traffic classes. Each is its own design exercise;

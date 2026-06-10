@@ -29,7 +29,7 @@
 use std::future::Future;
 
 use crate::net::{NodeId, Topology};
-use crate::task::{NodeContext, TaskSimBuilder, TaskSimStats};
+use crate::task::{FailureAction, NodeContext, TaskSimBuilder, TaskSimStats};
 use crate::time::{Duration, Time};
 
 /// Convenience builder for task-based scenarios.
@@ -38,6 +38,8 @@ pub struct Scenario<M: Clone + 'static> {
     seed: u64,
     /// Initial message injections applied at `Time::ZERO` before the run.
     injections: Vec<(NodeId, NodeId, M)>,
+    /// Failure actions scheduled to fire at fixed simulated times.
+    failures: Vec<(Time, FailureAction)>,
     /// Optional wall-clock budget in simulated time.
     run_until: Option<Time>,
 }
@@ -50,8 +52,31 @@ impl<M: Clone + 'static> Scenario<M> {
             topology,
             seed,
             injections: Vec::new(),
+            failures: Vec::new(),
             run_until: None,
         }
+    }
+
+    /// Schedules a [`FailureAction`] to fire at simulated time `time`.
+    ///
+    /// Replaces the hand-rolled "check `ctx.now()` on every tick and flip a
+    /// flag" pattern with declarative data. Failures fire deterministically in
+    /// time order (ties broken by `fail_at` call order), and a failure-kind
+    /// action drops in-flight messages when the scenario's sim was built with
+    /// in-flight drop. Heals (`FailureAction::Heal*`) restore the surface.
+    ///
+    /// ```ignore
+    /// use simulacra::{Duration, FailureAction, NodeId, Scenario, Time, TopologyBuilder};
+    ///
+    /// let stats = Scenario::<u32>::new(topology, 42)
+    ///     .fail_at(Time::from_millis(30), FailureAction::FailLink(NodeId(0), NodeId(1)))
+    ///     .fail_at(Time::from_millis(90), FailureAction::HealLink(NodeId(0), NodeId(1)))
+    ///     .run(|ctx| async move { /* ... */ });
+    /// ```
+    #[must_use]
+    pub fn fail_at(mut self, time: Time, action: FailureAction) -> Self {
+        self.failures.push((time, action));
+        self
     }
 
     /// Queues a message to be injected at `Time::ZERO`, before any task runs.
@@ -87,12 +112,16 @@ impl<M: Clone + 'static> Scenario<M> {
             topology,
             seed,
             injections,
+            failures,
             run_until,
         } = self;
 
         let mut sim = TaskSimBuilder::<M>::new(topology, seed).build(node_fn);
         for (src, dst, payload) in injections {
             sim.inject(src, dst, payload);
+        }
+        for (time, action) in failures {
+            sim.schedule_failure(time, action);
         }
 
         match run_until {
@@ -123,6 +152,36 @@ mod tests {
             });
 
         assert_eq!(stats.messages_delivered, 1);
+    }
+
+    #[test]
+    fn scenario_fail_at_drops_a_later_send() {
+        // Schedule both of node 0's links to fail at t=10ms; a send from node 0
+        // at t=20ms must then find no route and drop.
+        let topology = TopologyBuilder::new(3)
+            .link(0u32, 1u32, Duration::from_millis(5))
+            .link(1u32, 2u32, Duration::from_millis(5))
+            .link(0u32, 2u32, Duration::from_millis(50))
+            .build();
+
+        let stats = Scenario::<u64>::new(topology, 1)
+            .fail_at(
+                Time::from_millis(10),
+                FailureAction::FailLink(NodeId(0), NodeId(1)),
+            )
+            .fail_at(
+                Time::from_millis(10),
+                FailureAction::FailLink(NodeId(0), NodeId(2)),
+            )
+            .run(|ctx| async move {
+                if ctx.id() == NodeId(0) {
+                    ctx.sleep(Duration::from_millis(20)).await;
+                    ctx.send(NodeId(2), 1).await;
+                }
+            });
+
+        assert_eq!(stats.messages_delivered, 0);
+        assert_eq!(stats.messages_dropped, 1);
     }
 
     #[test]

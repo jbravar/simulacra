@@ -20,7 +20,8 @@
 )]
 
 use simulacra::{
-    Duration, NetConfig, NetEvent, NodeId, TopologyBuilder, TracedNetwork, UniformJitter,
+    Duration, NetConfig, NetEvent, NodeId, TaskSimBuilder, TopologyBuilder, TracedNetwork,
+    UniformJitter,
 };
 
 /// A deliberately non-trivial scenario: 20-node ring, jitter + packet loss,
@@ -306,6 +307,201 @@ fn drop_in_flight_scenario_actually_drops_messages() {
     let trace = run_drop_in_flight_scenario(0xFEED);
     assert_eq!(trace.matches("\"Partitioned\"").count(), 5);
     assert_eq!(trace.matches("\"Delivered\"").count(), 1);
+}
+
+/// Task-layer (async `TaskSim`) determinism scenario. The async facade has
+/// its own event queue and trace path, separate from `TracedNetwork`; this is
+/// the guardrail for that path. A single driver node (0) on a triangle drives
+/// the whole failure surface from inside its task: a healthy delivery, a
+/// mid-run `fail_link` pair that forces a `NoRoute` drop, then a `heal_link`
+/// pair that restores delivery — recorded via `TaskSimBuilder::with_trace`.
+fn run_task_scenario(seed: u64) -> String {
+    let topology = TopologyBuilder::new(3)
+        .link(0u32, 1u32, Duration::from_millis(5))
+        .link(1u32, 2u32, Duration::from_millis(5))
+        .link(0u32, 2u32, Duration::from_millis(50))
+        .build();
+
+    let sim = TaskSimBuilder::<u64>::new(topology, seed)
+        .with_trace()
+        .build(|ctx| async move {
+            // Only node 0 acts; the others' tasks complete immediately but
+            // still receive (and so get recorded as) deliveries.
+            if ctx.id().as_u32() == 0 {
+                // Healthy: 0->2 routes via the fast 0-1-2 path (10ms).
+                ctx.send(NodeId(2), 100).await;
+                ctx.sleep(Duration::from_millis(20)).await;
+
+                // Fail both of node 0's edges: 0->2 now has no route.
+                ctx.fail_link(NodeId(0), NodeId(1));
+                ctx.fail_link(NodeId(0), NodeId(2));
+                ctx.send(NodeId(2), 200).await; // NoRoute drop at t=20ms
+
+                ctx.sleep(Duration::from_millis(20)).await;
+
+                // Heal both edges: 0->2 is deliverable again.
+                ctx.heal_link(NodeId(0), NodeId(1));
+                ctx.heal_link(NodeId(0), NodeId(2));
+                ctx.send(NodeId(2), 300).await; // delivered at t=50ms
+            }
+        });
+
+    let (_stats, trace) = sim.run_traced();
+    trace
+        .to_json()
+        .expect("task trace should serialize to JSON cleanly")
+}
+
+#[test]
+fn task_scenario_is_byte_equal_across_runs() {
+    let a = run_task_scenario(0xABCD);
+    let b = run_task_scenario(0xABCD);
+    assert_eq!(
+        a, b,
+        "two task-sim runs with the same seed produced different JSON traces; \
+         task-layer determinism has regressed"
+    );
+}
+
+#[test]
+fn task_scenario_includes_delivery_and_noroute_drop() {
+    // The scenario must exercise both sides of the task trace: real
+    // deliveries and a NoRoute drop while node 0 is fully cut off.
+    let trace = run_task_scenario(0xABCD);
+    assert!(
+        trace.contains("\"NoRoute\""),
+        "expected a NoRoute drop after both of node 0's links failed: {trace}"
+    );
+    let delivered = trace.matches("\"Delivered\"").count();
+    assert_eq!(
+        delivered, 2,
+        "expected exactly 2 deliveries (messages 100 and 300); got {delivered}"
+    );
+}
+
+/// Task-layer in-flight-drop scenario. Node 0 fires four 0->2 messages (each
+/// ~100ms in flight), then partitions the pair at t=20ms before any deliver.
+/// With `drop_in_flight_on_failure`, the sweep rewrites all four pending
+/// `Deliver` events into `Partitioned` drops — exercising the task-layer
+/// `EventQueue` rewrite path under tracing.
+fn run_task_drop_in_flight_scenario(seed: u64) -> String {
+    let topology = TopologyBuilder::new(3)
+        .link(0u32, 1u32, Duration::from_millis(50))
+        .link(1u32, 2u32, Duration::from_millis(50))
+        .build();
+
+    let sim = TaskSimBuilder::<u64>::new(topology, seed)
+        .with_trace()
+        .drop_in_flight_on_failure()
+        .build(|ctx| async move {
+            if ctx.id() == NodeId(0) {
+                for i in 0..4u64 {
+                    ctx.send(NodeId(2), i).await;
+                }
+                ctx.sleep(Duration::from_millis(20)).await;
+                ctx.partition(NodeId(0), NodeId(2));
+            }
+        });
+
+    let (_stats, trace) = sim.run_traced();
+    trace
+        .to_json()
+        .expect("task drop-in-flight trace should serialize to JSON cleanly")
+}
+
+#[test]
+fn task_drop_in_flight_is_byte_equal_across_runs() {
+    let a = run_task_drop_in_flight_scenario(0x1234);
+    let b = run_task_drop_in_flight_scenario(0x1234);
+    assert_eq!(
+        a, b,
+        "two task-sim drop-in-flight runs with the same seed produced \
+         different JSON traces; the rewrite path is non-deterministic"
+    );
+}
+
+#[test]
+fn task_drop_in_flight_drops_all_pending() {
+    let trace = run_task_drop_in_flight_scenario(0x1234);
+    assert_eq!(
+        trace.matches("\"Partitioned\"").count(),
+        4,
+        "expected all four in-flight messages swept into Partitioned drops"
+    );
+    assert_eq!(
+        trace.matches("\"Delivered\"").count(),
+        0,
+        "no message should have been delivered after the partition"
+    );
+}
+
+/// Task-layer scheduled-failure scenario. Drives the whole failure surface
+/// declaratively via `TaskSim::schedule_failure` (the engine under
+/// `Scenario::fail_at`) instead of from inside node tasks: both of node 0's
+/// edges fail at t=10ms and heal at t=40ms. Node 0 sends before the failure
+/// (delivered), during the outage (`NoRoute` drop), and after the heal
+/// (delivered).
+fn run_task_scheduled_failure_scenario(seed: u64) -> String {
+    use simulacra::{FailureAction, Time};
+
+    let topology = TopologyBuilder::new(3)
+        .link(0u32, 1u32, Duration::from_millis(5))
+        .link(1u32, 2u32, Duration::from_millis(5))
+        .link(0u32, 2u32, Duration::from_millis(50))
+        .build();
+
+    let mut sim = TaskSimBuilder::<u64>::new(topology, seed)
+        .with_trace()
+        .build(|ctx| async move {
+            if ctx.id() == NodeId(0) {
+                ctx.send(NodeId(2), 1).await; // t=0: delivered
+                ctx.sleep(Duration::from_millis(20)).await;
+                ctx.send(NodeId(2), 2).await; // t=20: cut off -> NoRoute drop
+                ctx.sleep(Duration::from_millis(30)).await;
+                ctx.send(NodeId(2), 3).await; // t=50: healed -> delivered
+            }
+        });
+
+    for (a, b) in [(0u32, 1u32), (0, 2)] {
+        sim.schedule_failure(
+            Time::from_millis(10),
+            FailureAction::FailLink(NodeId(a), NodeId(b)),
+        );
+        sim.schedule_failure(
+            Time::from_millis(40),
+            FailureAction::HealLink(NodeId(a), NodeId(b)),
+        );
+    }
+
+    let (_stats, trace) = sim.run_traced();
+    trace
+        .to_json()
+        .expect("task scheduled-failure trace should serialize to JSON cleanly")
+}
+
+#[test]
+fn task_scheduled_failure_is_byte_equal_across_runs() {
+    let a = run_task_scheduled_failure_scenario(0x5151);
+    let b = run_task_scheduled_failure_scenario(0x5151);
+    assert_eq!(
+        a, b,
+        "two scheduled-failure runs with the same seed produced different JSON \
+         traces; the ApplyFailure event path is non-deterministic"
+    );
+}
+
+#[test]
+fn task_scheduled_failure_includes_drop_and_recovery() {
+    let trace = run_task_scheduled_failure_scenario(0x5151);
+    assert!(
+        trace.contains("\"NoRoute\""),
+        "expected a NoRoute drop during the scheduled outage"
+    );
+    assert_eq!(
+        trace.matches("\"Delivered\"").count(),
+        2,
+        "expected deliveries before the failure and after the heal"
+    );
 }
 
 /// Coarse shape check on the emitted trace.
