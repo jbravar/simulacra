@@ -23,7 +23,7 @@ impl LatencyModel for FixedLatency {
 
 /// Uniform jitter model.
 ///
-/// Adds uniformly distributed jitter in the range [-max_jitter, +max_jitter]
+/// Adds uniformly distributed jitter in the range [-`max_jitter`, +`max_jitter`]
 /// to the base latency. Result is clamped to be non-negative.
 #[derive(Debug, Clone, Copy)]
 pub struct UniformJitter {
@@ -33,8 +33,9 @@ pub struct UniformJitter {
 
 impl UniformJitter {
     /// Creates a new uniform jitter model.
-    pub fn new(max_jitter: Duration) -> Self {
-        UniformJitter { max_jitter }
+    #[must_use]
+    pub const fn new(max_jitter: Duration) -> Self {
+        Self { max_jitter }
     }
 }
 
@@ -59,20 +60,35 @@ impl PercentageJitter {
     ///
     /// # Arguments
     /// * `percent` - Jitter percentage (e.g., 10.0 for 10%)
+    #[must_use]
     pub fn new(percent: f64) -> Self {
-        PercentageJitter {
+        Self {
             fraction: percent / 100.0,
         }
     }
 
     /// Creates from a fraction (0.0 to 1.0).
-    pub fn from_fraction(fraction: f64) -> Self {
-        PercentageJitter { fraction }
+    #[must_use]
+    pub const fn from_fraction(fraction: f64) -> Self {
+        Self { fraction }
     }
 }
 
 impl LatencyModel for PercentageJitter {
     fn compute(&mut self, base_latency: Duration, rng: &mut SimRng) -> Duration {
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "nanosecond count to f64 for the jitter fraction scaling; the \
+                      exact f64 result is part of the deterministic latency model and \
+                      must not change"
+        )]
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "fraction * non-negative nanos is a non-negative magnitude; the \
+                      round-toward-zero f64->u64 conversion is the model's defined, \
+                      determinism-bearing rounding and must not change"
+        )]
         let max_jitter_nanos = (base_latency.as_nanos() as f64 * self.fraction) as u64;
         let max_jitter = Duration::from_nanos(max_jitter_nanos);
         rng.duration_with_jitter(base_latency, max_jitter)
@@ -90,8 +106,9 @@ pub struct OverheadPlusJitter {
 
 impl OverheadPlusJitter {
     /// Creates a new overhead plus jitter model.
-    pub fn new(overhead: Duration, max_jitter: Duration) -> Self {
-        OverheadPlusJitter {
+    #[must_use]
+    pub const fn new(overhead: Duration, max_jitter: Duration) -> Self {
+        Self {
             overhead,
             max_jitter,
         }
@@ -123,8 +140,8 @@ pub struct SpikyLatency<L: LatencyModel> {
 
 impl<L: LatencyModel> SpikyLatency<L> {
     /// Creates a new spiky latency wrapper around `inner`.
-    pub fn new(inner: L, spike_probability: f64, spike_max: Duration) -> Self {
-        SpikyLatency {
+    pub const fn new(inner: L, spike_probability: f64, spike_max: Duration) -> Self {
+        Self {
             inner,
             spike_probability,
             spike_max,
@@ -139,6 +156,14 @@ impl<L: LatencyModel> LatencyModel for SpikyLatency<L> {
             && self.spike_max.as_nanos() > 0
             && rng.bool(self.spike_probability)
         {
+            #[expect(
+                clippy::arithmetic_side_effects,
+                reason = "`+ 1` makes the rng range inclusive of spike_max; overflow \
+                          needs as_nanos() == u64::MAX (an infeasible ~584-year \
+                          spike_max). Latent: a saturating fix would change the rng \
+                          draw range in that pathological config, altering the trace, \
+                          so the panic-on-overflow contract is kept"
+            )]
             let spike_nanos = rng.u64(self.spike_max.as_nanos() + 1);
             base.saturating_add(Duration::from_nanos(spike_nanos))
         } else {
@@ -184,8 +209,8 @@ mod tests {
         for _ in 0..1000 {
             let latency = model.compute(base, &mut rng);
             // `as_nanos()` returns u64, so non-negative is implicit;
-            // just assert the call succeeds.
-            let _ = latency.as_nanos();
+            // exercise the call and keep the result observable.
+            assert!(latency.as_nanos() < u64::MAX);
         }
     }
 

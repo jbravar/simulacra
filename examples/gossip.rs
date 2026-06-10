@@ -10,6 +10,12 @@
 //! cargo run --example gossip
 //! ```
 
+// Illustrative example, not load-bearing library code.
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "example code: scenario-bounded arithmetic, not load-bearing"
+)]
+
 use simulacra::{Duration, NodeContext, NodeId, TaskSimBuilder, TopologyBuilder};
 
 async fn gossip_node(ctx: NodeContext<String>) {
@@ -31,7 +37,7 @@ async fn gossip_node(ctx: NodeContext<String>) {
 
     ctx.sleep(Duration::from_millis(5)).await;
 
-    let rumor = format!("Rumor via N{}", my_id);
+    let rumor = format!("Rumor via N{my_id}");
     ctx.send(n1, rumor.clone()).await;
     ctx.send(n2, rumor).await;
 

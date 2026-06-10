@@ -4,6 +4,14 @@
 //! next neighbor up to `HOPS` times. Exercises the `TaskSim` poll/wake path
 //! plus message routing.
 
+// Benchmark harness, not load-bearing library code: loop indices and the
+// arithmetic that derives schedule times are bounded by the bench parameters.
+#![expect(
+    clippy::arithmetic_side_effects,
+    clippy::cast_possible_truncation,
+    reason = "bench harness: indices/arithmetic bounded by bench parameters"
+)]
+
 use std::hint::black_box;
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
@@ -47,7 +55,7 @@ fn bench_ring_gossip(c: &mut Criterion) {
                     black_box(stats);
                 },
                 BatchSize::SmallInput,
-            )
+            );
         });
     }
     group.finish();

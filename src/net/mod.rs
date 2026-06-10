@@ -55,6 +55,12 @@ impl DropPolicy {
     ///
     /// Panics on clearly-wrong inputs to fail fast at topology build time
     /// rather than silently admitting every message.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `min_bytes > max_bytes`, if `max_bytes > buffer_bytes`, or if
+    /// `max_prob` is not in the half-open range `(0.0, 1.0]`.
+    #[must_use]
     pub fn red(min_bytes: u64, max_bytes: u64, buffer_bytes: u64, max_prob: f64) -> Self {
         assert!(
             min_bytes <= max_bytes,
@@ -68,7 +74,7 @@ impl DropPolicy {
             max_prob > 0.0 && max_prob <= 1.0,
             "DropPolicy::red: max_prob ({max_prob}) must be in (0.0, 1.0]"
         );
-        DropPolicy::RandomEarlyDetection {
+        Self::RandomEarlyDetection {
             min_bytes,
             max_bytes,
             max_prob,
@@ -95,8 +101,8 @@ pub struct Message<P> {
 
 impl<P> Message<P> {
     /// Creates a new message.
-    pub fn new(id: MessageId, src: NodeId, dst: NodeId, payload: P) -> Self {
-        Message {
+    pub const fn new(id: MessageId, src: NodeId, dst: NodeId, payload: P) -> Self {
+        Self {
             id,
             src,
             dst,
@@ -149,7 +155,7 @@ pub struct NetConfig {
 
 impl Default for NetConfig {
     fn default() -> Self {
-        NetConfig {
+        Self {
             packet_loss: 0.0,
             drop_in_flight_on_failure: false,
         }
@@ -206,7 +212,7 @@ struct BandwidthState {
 
 /// Computes the transmission time for a message of `size_bytes` bytes at
 /// `bps` bytes per second, rounded up to the next nanosecond.
-fn transmission_duration(bps: u64, size_bytes: u64) -> Duration {
+const fn transmission_duration(bps: u64, size_bytes: u64) -> Duration {
     if bps == 0 || size_bytes == 0 {
         return Duration::ZERO;
     }
@@ -254,11 +260,11 @@ fn sweep_failure_drops<P>(
                 Some((s.time, NetEvent::Deliver(msg)))
             }
         }
-        other => Some((s.time, other)),
+        drop_event @ NetEvent::Drop { .. } => Some((s.time, drop_event)),
     });
 }
 
-fn partition_key(a: NodeId, b: NodeId) -> (NodeId, NodeId) {
+const fn partition_key(a: NodeId, b: NodeId) -> (NodeId, NodeId) {
     if a.as_u32() <= b.as_u32() {
         (a, b)
     } else {
@@ -277,7 +283,12 @@ fn pending_bytes_at(bps: u64, busy_until: Time, now: Time) -> u64 {
         return 0;
     }
     let remaining_ns = busy_until.as_nanos().saturating_sub(now.as_nanos());
-    let bytes = (remaining_ns as u128 * bps as u128) / 1_000_000_000u128;
+    #[expect(
+        clippy::arithmetic_side_effects,
+        reason = "both operands are u64 widened to u128; (2^64-1)^2 < 2^128 so the \
+                  product cannot overflow u128, and the divisor is a nonzero constant"
+    )]
+    let bytes = (u128::from(remaining_ns) * u128::from(bps)) / 1_000_000_000u128;
     u64::try_from(bytes).unwrap_or(u64::MAX)
 }
 
@@ -309,9 +320,25 @@ fn policy_wants_drop(policy: DropPolicy, pending: u64, rng: &mut SimRng) -> bool
                 false
             } else {
                 // Linear ramp from 0.0 at min_bytes to max_prob at max_bytes.
-                let span = (max_bytes - min_bytes) as f64;
-                let over = (pending - min_bytes) as f64;
-                let prob = max_prob * (over / span);
+                // Reached only when min_bytes <= pending < max_bytes and
+                // max_bytes != min_bytes (RED constructor enforces
+                // min_bytes <= max_bytes), so both subtractions are >= 0.
+                #[expect(
+                    clippy::arithmetic_side_effects,
+                    reason = "max_bytes > min_bytes and pending >= min_bytes hold on \
+                              this branch, so both subtractions cannot underflow"
+                )]
+                #[expect(
+                    clippy::cast_precision_loss,
+                    reason = "byte counts to f64 for the RED probability ramp; the \
+                              exact f64 result is part of the deterministic drop model \
+                              feeding rng.bool and must not change"
+                )]
+                let prob = {
+                    let span = (max_bytes - min_bytes) as f64;
+                    let over = (pending - min_bytes) as f64;
+                    max_prob * (over / span)
+                };
                 rng.bool(prob)
             }
         }
@@ -357,7 +384,7 @@ fn walk_per_link_bandwidth(
         };
 
         let link = topology.link_between(current, next).copied();
-        let link_latency = link.map(|l| l.latency).unwrap_or(Duration::ZERO);
+        let link_latency = link.map_or(Duration::ZERO, |l| l.latency);
         let link_bandwidth = link.and_then(|l| l.bandwidth);
         let link_buffer = link.and_then(|l| l.buffer_bytes);
         let link_policy = link.map(|l| l.drop_policy).unwrap_or_default();
@@ -386,14 +413,35 @@ fn walk_per_link_bandwidth(
 
             let tx = transmission_duration(bps, size_bytes);
             let departure = hop_time.max(busy);
-            let free_at = departure + tx;
-            admissions.push(((current, next), free_at));
-            hop_time = free_at + link_latency;
+            #[expect(
+                clippy::arithmetic_side_effects,
+                reason = "Time/Duration `+` and `+=` are internally checked and \
+                          panic-on-overflow per the documented time contract"
+            )]
+            {
+                let free_at = departure + tx;
+                admissions.push(((current, next), free_at));
+                hop_time = free_at + link_latency;
+            }
         } else {
-            hop_time += link_latency;
+            #[expect(
+                clippy::arithmetic_side_effects,
+                reason = "Time `+=` Duration is internally checked and \
+                          panic-on-overflow per the documented time contract"
+            )]
+            {
+                hop_time += link_latency;
+            }
         }
 
-        accumulated_link_latency += link_latency;
+        #[expect(
+            clippy::arithmetic_side_effects,
+            reason = "Duration `+=` Duration is internally checked and \
+                      panic-on-overflow per the documented time contract"
+        )]
+        {
+            accumulated_link_latency += link_latency;
+        }
         current = next;
     }
 
@@ -408,8 +456,9 @@ fn walk_per_link_bandwidth(
 
 impl<P> Network<P, FixedLatency> {
     /// Creates a new network simulation with the given topology.
+    #[must_use]
     pub fn new(topology: Topology, seed: u64) -> Self {
-        Network {
+        Self {
             sim: Simulation::new(),
             topology,
             latency_model: FixedLatency,
@@ -426,7 +475,7 @@ impl<P> Network<P, FixedLatency> {
 impl<P, L: LatencyModel> Network<P, L> {
     /// Creates a new network simulation with a custom latency model.
     pub fn with_latency_model(topology: Topology, latency_model: L, seed: u64) -> Self {
-        Network {
+        Self {
             sim: Simulation::new(),
             topology,
             latency_model,
@@ -568,26 +617,27 @@ impl<P, L: LatencyModel> Network<P, L> {
     }
 
     /// Sets the network configuration.
-    pub fn with_config(mut self, config: NetConfig) -> Self {
+    #[must_use]
+    pub const fn with_config(mut self, config: NetConfig) -> Self {
         self.config = config;
         self
     }
 
     /// Returns the current simulated time.
     #[inline]
-    pub fn now(&self) -> Time {
+    pub const fn now(&self) -> Time {
         self.sim.now()
     }
 
     /// Returns a reference to the topology.
     #[inline]
-    pub fn topology(&self) -> &Topology {
+    pub const fn topology(&self) -> &Topology {
         &self.topology
     }
 
     /// Returns a mutable reference to the topology.
     #[inline]
-    pub fn topology_mut(&mut self) -> &mut Topology {
+    pub const fn topology_mut(&mut self) -> &mut Topology {
         &mut self.topology
     }
 
@@ -644,6 +694,12 @@ impl<P, L: LatencyModel> Network<P, L> {
     /// Core send path shared by `send`, `send_sized`, `send_at`, and
     /// `send_at_sized`. Applies partition, loss, routing, latency, and
     /// optional bandwidth serialization in a single place.
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "shared core of the public `send*` API whose documented contract is \
+                  `Option<MessageId>` (\"None if no route exists\"); the Option is \
+                  intentional public fallibility kept stable for future variants"
+    )]
     fn enqueue_send(
         &mut self,
         base_time: Time,
@@ -653,7 +709,14 @@ impl<P, L: LatencyModel> Network<P, L> {
         size_bytes: u64,
     ) -> Option<MessageId> {
         let id = MessageId::new(self.next_message_id);
-        self.next_message_id += 1;
+        #[expect(
+            clippy::arithmetic_side_effects,
+            reason = "monotonic u64 message-id counter; 2^64 sends is physically \
+                      unreachable in a simulation run"
+        )]
+        {
+            self.next_message_id += 1;
+        }
 
         let message = Message::new(id, src, dst, payload);
 
@@ -682,18 +745,15 @@ impl<P, L: LatencyModel> Network<P, L> {
         }
 
         // Find route.
-        let route = match self.topology.route(src, dst) {
-            Some(r) => r,
-            None => {
-                self.sim.schedule(
-                    base_time,
-                    NetEvent::Drop {
-                        message,
-                        reason: DropReason::NoRoute,
-                    },
-                );
-                return Some(id);
-            }
+        let Some(route) = self.topology.route(src, dst) else {
+            self.sim.schedule(
+                base_time,
+                NetEvent::Drop {
+                    message,
+                    reason: DropReason::NoRoute,
+                },
+            );
+            return Some(id);
         };
 
         // Compute latency with model.
@@ -706,6 +766,11 @@ impl<P, L: LatencyModel> Network<P, L> {
             Some(state) if size_bytes > 0 => {
                 let earliest = base_time.max(state.link_free_at);
                 let tx = transmission_duration(state.bps, size_bytes);
+                #[expect(
+                    clippy::arithmetic_side_effects,
+                    reason = "Time `+` Duration is internally checked and \
+                              panic-on-overflow per the documented time contract"
+                )]
                 let free_at = earliest + tx;
                 state.link_free_at = free_at;
                 (earliest, tx)
@@ -718,8 +783,14 @@ impl<P, L: LatencyModel> Network<P, L> {
         // flows that traverse it. Returns the extra delay beyond `latency`
         // that per-link transmission + queueing contributed, or signals
         // buffer overflow in which case the message is dropped.
+        #[expect(
+            clippy::arithmetic_side_effects,
+            reason = "Time `+` Duration is internally checked and panic-on-overflow \
+                      per the documented time contract"
+        )]
+        let admission_arrival = departure_time + pair_tx;
         let link_bandwidth_delay = if size_bytes > 0 {
-            match self.apply_per_link_bandwidth(src, dst, size_bytes, departure_time + pair_tx) {
+            match self.apply_per_link_bandwidth(src, dst, size_bytes, admission_arrival) {
                 PerLinkOutcome::Admitted(d) => d,
                 PerLinkOutcome::Overflow => {
                     self.sim.schedule(
@@ -736,6 +807,11 @@ impl<P, L: LatencyModel> Network<P, L> {
             Duration::ZERO
         };
 
+        #[expect(
+            clippy::arithmetic_side_effects,
+            reason = "chained Time `+` Duration ops are internally checked and \
+                      panic-on-overflow per the documented time contract"
+        )]
         let delivery_time = departure_time + pair_tx + latency + link_bandwidth_delay;
         self.sim.schedule(delivery_time, NetEvent::Deliver(message));
         Some(id)
@@ -773,16 +849,21 @@ impl<P, L: LatencyModel> Network<P, L> {
     }
 
     /// Returns the total number of messages sent.
-    pub fn messages_sent(&self) -> u64 {
+    pub const fn messages_sent(&self) -> u64 {
         self.next_message_id
     }
 
     /// Runs the simulation to completion.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the network run loop is the determinism-critical core; splitting it \
+                  risks reordering events or changing tie-breaks, so it is kept whole"
+    )]
     pub fn run<F>(self, handler: F) -> NetworkStats
     where
         F: FnMut(&mut RunContext<P, L>, NetEvent<P>),
     {
-        let Network {
+        let Self {
             sim,
             topology,
             latency_model,
@@ -817,6 +898,11 @@ impl<P, L: LatencyModel> Network<P, L> {
             ctx.now = sim.now();
 
             // Track stats
+            #[expect(
+                clippy::arithmetic_side_effects,
+                reason = "monotonic u64 event counters; 2^64 events is physically \
+                          unreachable in a simulation run"
+            )]
             match &event {
                 NetEvent::Deliver(_) => ctx.delivered += 1,
                 NetEvent::Drop { .. } => ctx.dropped += 1,
@@ -841,7 +927,14 @@ impl<P, L: LatencyModel> Network<P, L> {
             // Process pending sends after handler completes
             for (src, dst, payload, size_bytes) in ctx.pending_sends.drain(..) {
                 let id = MessageId::new(ctx.next_message_id);
-                ctx.next_message_id += 1;
+                #[expect(
+                    clippy::arithmetic_side_effects,
+                    reason = "monotonic u64 message-id counter; 2^64 sends is \
+                              physically unreachable in a simulation run"
+                )]
+                {
+                    ctx.next_message_id += 1;
+                }
 
                 let message = Message::new(id, src, dst, payload);
 
@@ -867,18 +960,15 @@ impl<P, L: LatencyModel> Network<P, L> {
                     continue;
                 }
 
-                let route = match ctx.topology.route(src, dst) {
-                    Some(r) => r,
-                    None => {
-                        sim.schedule(
-                            sim.now(),
-                            NetEvent::Drop {
-                                message,
-                                reason: DropReason::NoRoute,
-                            },
-                        );
-                        continue;
-                    }
+                let Some(route) = ctx.topology.route(src, dst) else {
+                    sim.schedule(
+                        sim.now(),
+                        NetEvent::Drop {
+                            message,
+                            reason: DropReason::NoRoute,
+                        },
+                    );
+                    continue;
                 };
 
                 let latency = ctx.latency_model.compute(route.total_latency, &mut ctx.rng);
@@ -888,6 +978,12 @@ impl<P, L: LatencyModel> Network<P, L> {
                     Some(state) if size_bytes > 0 => {
                         let earliest = base_time.max(state.link_free_at);
                         let tx = transmission_duration(state.bps, size_bytes);
+                        #[expect(
+                            clippy::arithmetic_side_effects,
+                            reason = "Time `+` Duration is internally checked and \
+                                      panic-on-overflow per the documented time \
+                                      contract"
+                        )]
                         let free_at = earliest + tx;
                         state.link_free_at = free_at;
                         (earliest, tx)
@@ -896,6 +992,12 @@ impl<P, L: LatencyModel> Network<P, L> {
                 };
 
                 // Walk the path for per-link bandwidth.
+                #[expect(
+                    clippy::arithmetic_side_effects,
+                    reason = "Time `+` Duration is internally checked and \
+                              panic-on-overflow per the documented time contract"
+                )]
+                let admission_arrival = departure_time + pair_tx;
                 let link_bandwidth_delay = if size_bytes > 0 {
                     match walk_per_link_bandwidth(
                         &mut ctx.topology,
@@ -904,7 +1006,7 @@ impl<P, L: LatencyModel> Network<P, L> {
                         src,
                         dst,
                         size_bytes,
-                        departure_time + pair_tx,
+                        admission_arrival,
                     ) {
                         PerLinkOutcome::Admitted(d) => d,
                         PerLinkOutcome::Overflow => {
@@ -922,6 +1024,11 @@ impl<P, L: LatencyModel> Network<P, L> {
                     Duration::ZERO
                 };
 
+                #[expect(
+                    clippy::arithmetic_side_effects,
+                    reason = "chained Time `+` Duration ops are internally checked and \
+                              panic-on-overflow per the documented time contract"
+                )]
                 let delivery_time = departure_time + pair_tx + latency + link_bandwidth_delay;
                 sim.schedule(delivery_time, NetEvent::Deliver(message));
             }
@@ -961,7 +1068,7 @@ pub struct RunContext<P, L: LatencyModel> {
 
 impl<P, L: LatencyModel> RunContext<P, L> {
     /// Returns the current simulated time.
-    pub fn now(&self) -> Time {
+    pub const fn now(&self) -> Time {
         self.now
     }
 
@@ -1075,17 +1182,17 @@ impl<P, L: LatencyModel> RunContext<P, L> {
     }
 
     /// Returns a reference to the topology.
-    pub fn topology(&self) -> &Topology {
+    pub const fn topology(&self) -> &Topology {
         &self.topology
     }
 
     /// Returns a mutable reference to the topology.
-    pub fn topology_mut(&mut self) -> &mut Topology {
+    pub const fn topology_mut(&mut self) -> &mut Topology {
         &mut self.topology
     }
 
     /// Returns the RNG for use in handlers.
-    pub fn rng(&mut self) -> &mut SimRng {
+    pub const fn rng(&mut self) -> &mut SimRng {
         &mut self.rng
     }
 }
@@ -1515,11 +1622,16 @@ mod tests {
 
         let mut net: Network<u32> = Network::new(topo, 42);
         for i in 0..4 {
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "loop counter is 0..4, always fits in u32"
+            )]
+            let payload = i as u32;
             net.send_at_sized(
                 Time::from_secs(2 * i),
                 NodeId(0),
                 NodeId(1),
-                i as u32,
+                payload,
                 1_000_000,
             );
         }
@@ -1654,7 +1766,7 @@ mod tests {
                 )
                 .build();
 
-            let mut net: Network<u32> = Network::new(topo, 0xC0FFEE);
+            let mut net: Network<u32> = Network::new(topo, 0x00C0_FFEE);
             for i in 0..20 {
                 net.send_sized(NodeId(0), NodeId(1), i, 1_000_000);
             }
@@ -1819,8 +1931,7 @@ mod tests {
         // Some message was delayed beyond the base 10ms.
         assert!(
             max_time > Time::from_millis(10),
-            "expected at least one spike beyond base latency, got max_time = {}",
-            max_time
+            "expected at least one spike beyond base latency, got max_time = {max_time}"
         );
     }
 
@@ -2246,7 +2357,7 @@ mod tests {
                 events_seen.push((message.payload, ctx.now()));
                 assert_eq!(reason, DropReason::NoRoute);
             }
-            _ => {}
+            NetEvent::Deliver(_) => {}
         });
 
         // Tick fired at 5ms; doomed message dropped at 5ms (time of failure),

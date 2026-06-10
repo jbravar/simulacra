@@ -4,6 +4,14 @@
 //! topology of size N. Exercises `Network::send` path, routing cache,
 //! and event-queue drain.
 
+// Benchmark harness, not load-bearing library code: loop indices and the
+// arithmetic that derives schedule times are bounded by the bench parameters.
+#![expect(
+    clippy::arithmetic_side_effects,
+    clippy::cast_possible_truncation,
+    reason = "bench harness: indices/arithmetic bounded by bench parameters"
+)]
+
 use std::hint::black_box;
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
@@ -19,7 +27,7 @@ fn bench_star_broadcast(c: &mut Criterion) {
                     let topology = TopologyBuilder::new(n)
                         .star(Duration::from_millis(5))
                         .build();
-                    let mut net: Network<u64> = Network::new(topology, 0xC0FFEE);
+                    let mut net: Network<u64> = Network::new(topology, 0x00C0_FFEE);
                     for dst in 1..n {
                         net.send(NodeId(0), NodeId(dst as u32), dst as u64);
                     }
@@ -34,7 +42,7 @@ fn bench_star_broadcast(c: &mut Criterion) {
                     black_box(stats);
                 },
                 BatchSize::SmallInput,
-            )
+            );
         });
     }
     group.finish();

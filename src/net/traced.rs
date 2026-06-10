@@ -37,7 +37,7 @@ pub enum NetTraceEvent {
     },
 }
 
-/// Serializable version of DropReason.
+/// Serializable version of `DropReason`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum NetTraceDropReason {
@@ -54,10 +54,10 @@ pub enum NetTraceDropReason {
 impl From<DropReason> for NetTraceDropReason {
     fn from(reason: DropReason) -> Self {
         match reason {
-            DropReason::NoRoute => NetTraceDropReason::NoRoute,
-            DropReason::PacketLoss => NetTraceDropReason::PacketLoss,
-            DropReason::Partitioned => NetTraceDropReason::Partitioned,
-            DropReason::BufferOverflow => NetTraceDropReason::BufferOverflow,
+            DropReason::NoRoute => Self::NoRoute,
+            DropReason::PacketLoss => Self::PacketLoss,
+            DropReason::Partitioned => Self::Partitioned,
+            DropReason::BufferOverflow => Self::BufferOverflow,
         }
     }
 }
@@ -70,8 +70,9 @@ pub struct TracedNetwork<P, L: LatencyModel> {
 
 impl<P> TracedNetwork<P, crate::net::FixedLatency> {
     /// Creates a new traced network simulation.
+    #[must_use]
     pub fn new(topology: Topology, seed: u64) -> Self {
-        TracedNetwork {
+        Self {
             network: Network::new(topology, seed),
             seed,
         }
@@ -81,13 +82,14 @@ impl<P> TracedNetwork<P, crate::net::FixedLatency> {
 impl<P, L: LatencyModel> TracedNetwork<P, L> {
     /// Creates a new traced network with a custom latency model.
     pub fn with_latency_model(topology: Topology, latency_model: L, seed: u64) -> Self {
-        TracedNetwork {
+        Self {
             network: Network::with_latency_model(topology, latency_model, seed),
             seed,
         }
     }
 
     /// Replaces the network's [`NetConfig`]. See [`Network::with_config`].
+    #[must_use]
     pub fn with_config(mut self, config: NetConfig) -> Self {
         self.network = self.network.with_config(config);
         self
@@ -174,17 +176,17 @@ impl<P, L: LatencyModel> TracedNetwork<P, L> {
     }
 
     /// Returns the current simulated time.
-    pub fn now(&self) -> Time {
+    pub const fn now(&self) -> Time {
         self.network.now()
     }
 
     /// Returns a reference to the topology.
-    pub fn topology(&self) -> &Topology {
+    pub const fn topology(&self) -> &Topology {
         self.network.topology()
     }
 
     /// Returns a mutable reference to the topology.
-    pub fn topology_mut(&mut self) -> &mut Topology {
+    pub const fn topology_mut(&mut self) -> &mut Topology {
         self.network.topology_mut()
     }
 
@@ -328,7 +330,7 @@ mod tests {
         let trace1 = run_sim();
         let trace2 = run_sim();
 
-        assert!(trace1.compare(&trace2).is_ok());
+        trace1.compare(&trace2).unwrap();
     }
 
     #[cfg(feature = "serde")]
@@ -346,6 +348,6 @@ mod tests {
         let json = trace.to_json().unwrap();
         let parsed: Trace<NetTraceEvent> = Trace::from_json(&json).unwrap();
 
-        assert!(trace.compare(&parsed).is_ok());
+        trace.compare(&parsed).unwrap();
     }
 }

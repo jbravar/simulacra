@@ -128,7 +128,15 @@ Uses Rust **2024 edition** - ensure your toolchain is up to date (`rustup update
 ### Style
 - Follow standard Rust conventions (rustfmt defaults)
 - Run `cargo fmt` before committing
-- Run `cargo clippy` to catch common issues
+- Run `cargo clippy --all-targets --all-features -- -D warnings` (the CI form).
+  The crate enables a strict lint set (`pedantic` + `nursery` + cherry-picked
+  `restriction` lints; see `[lints.clippy]` in `Cargo.toml` and `clippy.toml`).
+  Suppress a genuine false positive with a scoped `#[expect(lint, reason = "…")]`
+  — never a bare `#[allow]` (the `allow_attributes_without_reason` lint enforces
+  this). Kernel modules carry a documented module-level
+  `#[expect(clippy::arithmetic_side_effects)]` because integer-time arithmetic
+  panics on overflow *by design* (the determinism contract); do not "fix" that
+  by switching to `saturating_*`
 - Extensive doc comments on public APIs
 - Unit tests in `#[cfg(test)]` modules within each file
 

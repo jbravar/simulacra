@@ -6,6 +6,18 @@
 //! into the engine (wall-clock, unseeded RNG, hashmap iteration order, etc.).
 
 #![cfg(feature = "serde")]
+// Integration test harness, not library code. clippy.toml already exempts
+// tests from panic/unwrap/expect/indexing/dbg; this extends the same stance
+// to the remaining restriction-group lints that are pure noise in test
+// scaffolding (fixed seeds, bounded loop arithmetic, trace string slicing).
+#![expect(
+    clippy::arithmetic_side_effects,
+    clippy::cast_possible_truncation,
+    clippy::expect_used,
+    clippy::unreadable_literal,
+    clippy::string_slice,
+    reason = "integration test harness; mirrors clippy.toml allow-*-in-tests"
+)]
 
 use simulacra::{
     Duration, NetConfig, NetEvent, NodeId, TopologyBuilder, TracedNetwork, UniformJitter,
@@ -30,13 +42,13 @@ fn run_scenario(seed: u64) -> String {
     // Cross-traffic: every node sends to the node two hops ahead.
     for i in 0..node_count as u32 {
         let dst = (i + 2) % node_count as u32;
-        let _ = net.send(NodeId(i), NodeId(dst), i as u64);
+        let _ = net.send(NodeId(i), NodeId(dst), u64::from(i));
     }
 
     // Second wave: every node sends to the node five hops ahead.
     for i in 0..node_count as u32 {
         let dst = (i + 5) % node_count as u32;
-        let _ = net.send(NodeId(i), NodeId(dst), (i as u64) + 1000);
+        let _ = net.send(NodeId(i), NodeId(dst), u64::from(i) + 1000);
     }
 
     let (_stats, trace) = net.run_traced(|_ctx, _event| {});
@@ -87,7 +99,7 @@ fn run_link_failure_scenario(seed: u64) -> String {
 
     // Self-ticks on node 0 drive fail/heal actions at deterministic times.
     // Use the payload as a tag to dispatch in the handler.
-    for (i, t) in [(1u64, 0), (2, 30), (3, 60), (4, 90)].iter() {
+    for (i, t) in &[(1u64, 0), (2, 30), (3, 60), (4, 90)] {
         let _ = net.send_at(simulacra::Time::from_millis(*t), NodeId(0), NodeId(0), *i);
     }
 
@@ -151,7 +163,7 @@ fn run_node_failure_scenario(seed: u64) -> String {
     let latency_model = UniformJitter::new(Duration::from_millis(1));
     let mut net = TracedNetwork::<u64, _>::with_latency_model(topology, latency_model, seed);
 
-    for (tag, t) in [(1u64, 0u64), (2, 200), (3, 400), (4, 600)].iter() {
+    for (tag, t) in &[(1u64, 0u64), (2, 200), (3, 400), (4, 600)] {
         let _ = net.send_at(simulacra::Time::from_millis(*t), NodeId(0), NodeId(0), *tag);
     }
 
@@ -316,7 +328,6 @@ fn ring_gossip_scenario_matches_pinned_shape() {
     let delivered = trace.matches("\"Delivered\"").count();
     assert_eq!(
         delivered, 40,
-        "expected 40 Delivered events; got {}",
-        delivered
+        "expected 40 Delivered events; got {delivered}"
     );
 }

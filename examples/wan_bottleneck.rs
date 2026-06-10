@@ -22,6 +22,12 @@
 //! cargo run --example wan_bottleneck
 //! ```
 
+// Illustrative example, not load-bearing library code.
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "example code: scenario-bounded arithmetic, not load-bearing"
+)]
+
 use simulacra::{Duration, NetEvent, Network, NodeId, TopologyBuilder};
 
 const LAN_LATENCY: Duration = Duration::from_millis(1);

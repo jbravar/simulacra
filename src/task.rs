@@ -41,7 +41,7 @@ use crate::time::{Duration, Time};
 
 /// Canonical ordering for an unordered node pair, used as the key for
 /// symmetric partition tracking. Mirrors the helper used in `net::mod`.
-fn pair_key(a: NodeId, b: NodeId) -> (NodeId, NodeId) {
+const fn pair_key(a: NodeId, b: NodeId) -> (NodeId, NodeId) {
     if a.as_u32() <= b.as_u32() {
         (a, b)
     } else {
@@ -123,8 +123,8 @@ impl<M> SimState<M> {
 
 /// A cooperative cancellation signal shared by all tasks in a simulation.
 ///
-/// The flag is set by [`TaskSim::shutdown_token`]`.cancel()` (or by any task
-/// via [`NodeContext::shutdown_token`]`.cancel()`). Tasks can poll
+/// The flag is set by <code>[TaskSim::shutdown_token].cancel()</code> (or by any task
+/// via <code>[NodeContext::shutdown_token].cancel()</code>). Tasks can poll
 /// `is_cancelled()` to decide whether to exit early.
 #[derive(Clone)]
 pub struct CancellationToken {
@@ -133,6 +133,7 @@ pub struct CancellationToken {
 
 impl CancellationToken {
     /// Returns `true` if cancellation has been requested.
+    #[must_use]
     pub fn is_cancelled(&self) -> bool {
         self.flag.get()
     }
@@ -162,11 +163,13 @@ pub struct NodeContext<M: 'static> {
 
 impl<M: 'static> NodeContext<M> {
     /// Returns this node's ID.
-    pub fn id(&self) -> NodeId {
+    #[must_use]
+    pub const fn id(&self) -> NodeId {
         self.node_id
     }
 
     /// Returns the current simulation time.
+    #[must_use]
     pub fn now(&self) -> Time {
         self.state.borrow().now
     }
@@ -175,6 +178,7 @@ impl<M: 'static> NodeContext<M> {
     ///
     /// Tasks may poll `token.is_cancelled()` to decide whether to return
     /// early. Call `.cancel()` on any clone of the token to signal shutdown.
+    #[must_use]
     pub fn shutdown_token(&self) -> CancellationToken {
         CancellationToken {
             flag: Rc::clone(&self.state.borrow().cancelled),
@@ -195,6 +199,7 @@ impl<M: 'static> NodeContext<M> {
     }
 
     /// Returns `true` if `a` and `b` are currently partitioned.
+    #[must_use]
     pub fn is_partitioned(&self, a: NodeId, b: NodeId) -> bool {
         self.state.borrow().partitions.contains(&pair_key(a, b))
     }
@@ -214,6 +219,7 @@ impl<M: 'static> NodeContext<M> {
 
     /// Returns `true` if both directions of the link between `a` and `b`
     /// are currently failed.
+    #[must_use]
     pub fn is_link_failed(&self, a: NodeId, b: NodeId) -> bool {
         self.state.borrow().topology.is_link_failed(a, b)
     }
@@ -235,6 +241,7 @@ impl<M: 'static> NodeContext<M> {
     }
 
     /// Returns `true` if the directed edge `src -> dst` is failed.
+    #[must_use]
     pub fn is_link_failed_directed(&self, src: NodeId, dst: NodeId) -> bool {
         self.state
             .borrow()
@@ -253,12 +260,19 @@ impl<M: 'static> NodeContext<M> {
     }
 
     /// Returns `true` if `node` is currently marked as failed.
+    #[must_use]
     pub fn is_node_failed(&self, node: NodeId) -> bool {
         self.state.borrow().topology.is_node_failed(node)
     }
 
     /// Sleeps for the specified duration of simulated time.
+    #[must_use]
     pub fn sleep(&self, duration: Duration) -> Sleep<M> {
+        #[expect(
+            clippy::arithmetic_side_effects,
+            reason = "Time `+` Duration is internally checked and panic-on-overflow \
+                      per the documented time contract"
+        )]
         let wake_time = {
             let state = self.state.borrow();
             state.now + duration
@@ -274,6 +288,7 @@ impl<M: 'static> NodeContext<M> {
     /// Receives the next message sent to this node.
     ///
     /// If no message is available, the task will suspend until one arrives.
+    #[must_use]
     pub fn recv(&self) -> Recv<M> {
         Recv {
             state: Rc::clone(&self.state),
@@ -284,7 +299,13 @@ impl<M: 'static> NodeContext<M> {
     /// Receives the next message or returns `None` after `timeout` elapses.
     ///
     /// Deterministic: the timeout is measured in simulated time, not wall-clock.
+    #[must_use]
     pub fn recv_timeout(&self, timeout: Duration) -> RecvTimeout<M> {
+        #[expect(
+            clippy::arithmetic_side_effects,
+            reason = "Time `+` Duration is internally checked and panic-on-overflow \
+                      per the documented time contract"
+        )]
         let deadline = self.state.borrow().now + timeout;
         RecvTimeout {
             state: Rc::clone(&self.state),
@@ -349,6 +370,11 @@ impl<M: 'static> Future for Recv<M> {
 
     fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut state = self.state.borrow_mut();
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "node_id is a valid topology node (< nodes.len()); the recv \
+                      future is only constructed for the node's own context"
+        )]
         let node = &mut state.nodes[self.node_id.as_usize()];
 
         if let Some(envelope) = node.inbox.pop_front() {
@@ -381,6 +407,12 @@ impl<M: 'static> Future for RecvTimeout<M> {
         let task_id = self.task_id;
         let need_schedule = !self.wake_scheduled;
 
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "node_idx is a valid topology node (< nodes.len()); the \
+                      recv-timeout future is only constructed for the node's own \
+                      context"
+        )]
         let outcome = {
             let mut state = self.state.borrow_mut();
 
@@ -423,7 +455,10 @@ impl<M: Clone + 'static> Future for SendFut<M> {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // Use get_mut since we need to modify payload
+        // SAFETY: `SendFut` holds only `Rc`, `NodeId`, and `Option<M>` fields,
+        // none of which are address-sensitive or self-referential. We never
+        // move any field out of the pinned reference (we only call `.take()`
+        // on `payload` in place), so obtaining a `&mut Self` is sound.
         let this = unsafe { self.get_unchecked_mut() };
 
         if let Some(payload) = this.payload.take() {
@@ -434,18 +469,34 @@ impl<M: Clone + 'static> Future for SendFut<M> {
             // The send-future still completes cleanly — the message just
             // never lands in the destination's inbox. Stats track the drop.
             if state.partitions.contains(&pair_key(this.src, this.dst)) {
-                state.messages_dropped += 1;
+                #[expect(
+                    clippy::arithmetic_side_effects,
+                    reason = "monotonic u64 dropped-message counter; 2^64 sends is \
+                              physically unreachable in a simulation run"
+                )]
+                {
+                    state.messages_dropped += 1;
+                }
                 return Poll::Ready(());
             }
 
-            let route = match state.topology.route(this.src, this.dst) {
-                Some(r) => r,
-                None => {
+            let Some(route) = state.topology.route(this.src, this.dst) else {
+                #[expect(
+                    clippy::arithmetic_side_effects,
+                    reason = "monotonic u64 dropped-message counter; 2^64 sends is \
+                              physically unreachable in a simulation run"
+                )]
+                {
                     state.messages_dropped += 1;
-                    return Poll::Ready(());
                 }
+                return Poll::Ready(());
             };
 
+            #[expect(
+                clippy::arithmetic_side_effects,
+                reason = "Time `+` Duration is internally checked and \
+                          panic-on-overflow per the documented time contract"
+            )]
             let delivery_time = now + route.total_latency;
             state.events.schedule(
                 delivery_time,
@@ -480,7 +531,7 @@ pub enum Either<A, B> {
 ///
 /// Both futures must be safe to re-poll on `Pending`; `Sleep`, `Recv`, and
 /// `RecvTimeout` all satisfy this.
-pub fn select2<A, B>(a: A, b: B) -> Select2<A, B>
+pub const fn select2<A, B>(a: A, b: B) -> Select2<A, B>
 where
     A: Future,
     B: Future,
@@ -502,12 +553,18 @@ where
     type Output = Either<A::Output, B::Output>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // Safety: we do not move the inner futures out of `self`.
+        // SAFETY: we never move the inner futures `a`/`b` out of `self`; we
+        // only re-pin them in place below, so projecting `&mut Self` from the
+        // pinned reference upholds the structural pinning contract.
         let this = unsafe { self.get_unchecked_mut() };
+        // SAFETY: `this.a` is a field of the pinned `Self` and is never moved
+        // for the lifetime of this borrow, so re-pinning it is sound.
         let a = unsafe { Pin::new_unchecked(&mut this.a) };
         if let Poll::Ready(v) = a.poll(cx) {
             return Poll::Ready(Either::Left(v));
         }
+        // SAFETY: `this.b` is a field of the pinned `Self` and is never moved
+        // for the lifetime of this borrow, so re-pinning it is sound.
         let b = unsafe { Pin::new_unchecked(&mut this.b) };
         if let Poll::Ready(v) = b.poll(cx) {
             return Poll::Ready(Either::Right(v));
@@ -527,13 +584,18 @@ fn create_waker() -> Waker {
     fn clone_fn(data: *const ()) -> RawWaker {
         RawWaker::new(data, &VTABLE)
     }
-    fn wake_fn(_data: *const ()) {}
-    fn wake_by_ref_fn(_data: *const ()) {}
-    fn drop_fn(_data: *const ()) {}
+    const fn wake_fn(_data: *const ()) {}
+    const fn wake_by_ref_fn(_data: *const ()) {}
+    const fn drop_fn(_data: *const ()) {}
 
     static VTABLE: RawWakerVTable = RawWakerVTable::new(clone_fn, wake_fn, wake_by_ref_fn, drop_fn);
 
     let raw_waker = RawWaker::new(std::ptr::null(), &VTABLE);
+    // SAFETY: `VTABLE`'s functions form a valid `RawWakerVTable`: `clone`
+    // returns a `RawWaker` with the same vtable and the null data pointer,
+    // and `wake`/`wake_by_ref`/`drop` are no-ops that never dereference the
+    // (null) data pointer. These uphold the `RawWaker` contract, so building
+    // a `Waker` from it is sound.
     unsafe { Waker::from_raw(raw_waker) }
 }
 
@@ -546,8 +608,9 @@ pub struct TaskSimBuilder<M: 'static> {
 
 impl<M: 'static> TaskSimBuilder<M> {
     /// Creates a new task simulation builder.
-    pub fn new(topology: Topology, seed: u64) -> Self {
-        TaskSimBuilder {
+    #[must_use]
+    pub const fn new(topology: Topology, seed: u64) -> Self {
+        Self {
             topology,
             seed,
             _phantom: std::marker::PhantomData,
@@ -570,10 +633,18 @@ impl<M: 'static> TaskSimBuilder<M> {
             now: Time::ZERO,
             topology: self.topology,
             nodes: (0..node_count)
-                .map(|i| NodeState {
-                    inbox: VecDeque::new(),
-                    waiting_for_message: false,
-                    task_id: TaskId(i as u32),
+                .map(|i| {
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        reason = "TaskId is a 32-bit identifier; node_count never \
+                                  approaches 2^32"
+                    )]
+                    let task_id = TaskId(i as u32);
+                    NodeState {
+                        inbox: VecDeque::new(),
+                        waiting_for_message: false,
+                        task_id,
+                    }
                 })
                 .collect(),
             events: EventQueue::new(),
@@ -586,8 +657,12 @@ impl<M: 'static> TaskSimBuilder<M> {
         // Create tasks for each node
         let mut tasks = Vec::with_capacity(node_count);
         for i in 0..node_count {
-            let task_id = TaskId(i as u32);
-            let node_id = NodeId::new(i as u32);
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "TaskId/NodeId are 32-bit identifiers; node_count never \
+                          approaches 2^32"
+            )]
+            let (task_id, node_id) = (TaskId(i as u32), NodeId::new(i as u32));
 
             let ctx = NodeContext {
                 state: Rc::clone(&state),
@@ -606,7 +681,13 @@ impl<M: 'static> TaskSimBuilder<M> {
         {
             let mut s = state.borrow_mut();
             for i in 0..node_count {
-                s.ready_tasks.push(TaskId(i as u32));
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "TaskId is a 32-bit identifier; node_count never \
+                              approaches 2^32"
+                )]
+                let task_id = TaskId(i as u32);
+                s.ready_tasks.push(task_id);
             }
         }
 
@@ -663,18 +744,34 @@ impl<M: Clone + 'static> TaskSim<M> {
         let now = state.now;
 
         if state.partitions.contains(&pair_key(src, dst)) {
-            state.messages_dropped += 1;
+            #[expect(
+                clippy::arithmetic_side_effects,
+                reason = "monotonic u64 dropped-message counter; 2^64 sends is \
+                          physically unreachable in a simulation run"
+            )]
+            {
+                state.messages_dropped += 1;
+            }
             return;
         }
 
-        let route = match state.topology.route(src, dst) {
-            Some(r) => r,
-            None => {
+        let Some(route) = state.topology.route(src, dst) else {
+            #[expect(
+                clippy::arithmetic_side_effects,
+                reason = "monotonic u64 dropped-message counter; 2^64 sends is \
+                          physically unreachable in a simulation run"
+            )]
+            {
                 state.messages_dropped += 1;
-                return;
             }
+            return;
         };
 
+        #[expect(
+            clippy::arithmetic_side_effects,
+            reason = "Time `+` Duration is internally checked and panic-on-overflow \
+                      per the documented time contract"
+        )]
         let delivery_time = now + route.total_latency;
         state.events.schedule(
             delivery_time,
@@ -688,7 +785,8 @@ impl<M: Clone + 'static> TaskSim<M> {
     }
 
     /// Returns the seed used for this simulation.
-    pub fn seed(&self) -> u64 {
+    #[must_use]
+    pub const fn seed(&self) -> u64 {
         self.seed
     }
 
@@ -704,6 +802,7 @@ impl<M: Clone + 'static> TaskSim<M> {
     }
 
     /// Returns `true` if `a` and `b` are currently partitioned.
+    #[must_use]
     pub fn is_partitioned(&self, a: NodeId, b: NodeId) -> bool {
         self.state.borrow().partitions.contains(&pair_key(a, b))
     }
@@ -720,6 +819,7 @@ impl<M: Clone + 'static> TaskSim<M> {
 
     /// Returns `true` if both directions of the link between `a` and `b`
     /// are currently failed.
+    #[must_use]
     pub fn is_link_failed(&self, a: NodeId, b: NodeId) -> bool {
         self.state.borrow().topology.is_link_failed(a, b)
     }
@@ -741,6 +841,7 @@ impl<M: Clone + 'static> TaskSim<M> {
     }
 
     /// Returns `true` if the directed edge `src -> dst` is failed.
+    #[must_use]
     pub fn is_link_failed_directed(&self, src: NodeId, dst: NodeId) -> bool {
         self.state
             .borrow()
@@ -759,6 +860,7 @@ impl<M: Clone + 'static> TaskSim<M> {
     }
 
     /// Returns `true` if `node` is currently marked as failed.
+    #[must_use]
     pub fn is_node_failed(&self, node: NodeId) -> bool {
         self.state.borrow().topology.is_node_failed(node)
     }
@@ -767,6 +869,7 @@ impl<M: Clone + 'static> TaskSim<M> {
     ///
     /// Call `.cancel()` on the returned token (or any clone) to signal all
     /// tasks to shut down cooperatively.
+    #[must_use]
     pub fn shutdown_token(&self) -> CancellationToken {
         CancellationToken {
             flag: Rc::clone(&self.state.borrow().cancelled),
@@ -774,18 +877,26 @@ impl<M: Clone + 'static> TaskSim<M> {
     }
 
     /// Runs the simulation until no more events or tasks are pending.
+    #[must_use]
     pub fn run(self) -> TaskSimStats {
         self.run_until(|_| true)
     }
 
     /// Runs the simulation until the predicate returns false or completion.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the task-sim run loop is the determinism-critical core; splitting \
+                  it risks reordering events or wakes, so it is kept whole"
+    )]
     pub fn run_until<F>(mut self, mut continue_fn: F) -> TaskSimStats
     where
         F: FnMut(Time) -> bool,
     {
         let waker = create_waker();
         let mut cx = Context::from_waker(&waker);
-        let mut stats = TaskSimStats::default();
+        // Named `run_stats` (not `stats`) so it does not read as a near-typo
+        // of the many short-lived `state` borrows in this loop.
+        let mut run_stats = TaskSimStats::default();
 
         loop {
             // Swap the ready queue out into a scratch buffer we own, so we
@@ -803,10 +914,24 @@ impl<M: Clone + 'static> TaskSim<M> {
                     if task.completed {
                         continue;
                     }
-                    stats.task_polls += 1;
-                    if let Poll::Ready(()) = task.future.as_mut().poll(&mut cx) {
+                    #[expect(
+                        clippy::arithmetic_side_effects,
+                        reason = "monotonic u64 poll counter; 2^64 polls is \
+                                  physically unreachable in a simulation run"
+                    )]
+                    {
+                        run_stats.task_polls += 1;
+                    }
+                    if task.future.as_mut().poll(&mut cx) == Poll::Ready(()) {
                         task.completed = true;
-                        stats.tasks_completed += 1;
+                        #[expect(
+                            clippy::arithmetic_side_effects,
+                            reason = "monotonic u64 completion counter; 2^64 \
+                                      completions is physically unreachable"
+                        )]
+                        {
+                            run_stats.tasks_completed += 1;
+                        }
                     }
                 }
             }
@@ -814,35 +939,47 @@ impl<M: Clone + 'static> TaskSim<M> {
             // Find the next event
             let next_event = self.state.borrow_mut().events.pop();
 
-            match next_event {
-                Some(scheduled) => {
-                    // Check if we should continue
-                    if !continue_fn(scheduled.time) {
-                        break;
-                    }
+            if let Some(scheduled) = next_event {
+                // Check if we should continue
+                if !continue_fn(scheduled.time) {
+                    break;
+                }
 
-                    // Advance time
-                    {
+                // Advance time
+                {
+                    let mut state = self.state.borrow_mut();
+                    state.now = scheduled.time;
+                }
+                #[expect(
+                    clippy::arithmetic_side_effects,
+                    reason = "monotonic u64 event counter; 2^64 events is physically \
+                              unreachable in a simulation run"
+                )]
+                {
+                    run_stats.events_processed += 1;
+                }
+
+                match scheduled.event {
+                    TaskEvent::Wake(task_id) => {
                         let mut state = self.state.borrow_mut();
-                        state.now = scheduled.time;
+                        state.ready_tasks.push(task_id);
                     }
-                    stats.events_processed += 1;
+                    TaskEvent::Deliver {
+                        src,
+                        dst,
+                        payload,
+                        sent_at,
+                    } => {
+                        let mut state = self.state.borrow_mut();
+                        let now = state.now;
 
-                    match scheduled.event {
-                        TaskEvent::Wake(task_id) => {
-                            let mut state = self.state.borrow_mut();
-                            state.ready_tasks.push(task_id);
-                        }
-                        TaskEvent::Deliver {
-                            src,
-                            dst,
-                            payload,
-                            sent_at,
-                        } => {
-                            let mut state = self.state.borrow_mut();
-                            let now = state.now;
-
-                            if dst.as_usize() < state.nodes.len() {
+                        if dst.as_usize() < state.nodes.len() {
+                            #[expect(
+                                clippy::indexing_slicing,
+                                reason = "guarded by `dst.as_usize() < state.nodes\
+                                          .len()` on the enclosing `if`"
+                            )]
+                            {
                                 let task_id = state.nodes[dst.as_usize()].task_id;
                                 let waiting = state.nodes[dst.as_usize()].waiting_for_message;
 
@@ -859,24 +996,30 @@ impl<M: Clone + 'static> TaskSim<M> {
                                     state.ready_tasks.push(task_id);
                                 }
                             }
-                            stats.messages_delivered += 1;
+                        }
+                        #[expect(
+                            clippy::arithmetic_side_effects,
+                            reason = "monotonic u64 delivered-message counter; 2^64 \
+                                      deliveries is physically unreachable"
+                        )]
+                        {
+                            run_stats.messages_delivered += 1;
                         }
                     }
                 }
-                None => {
-                    // No more events - check if any tasks are ready
-                    let has_ready = !self.state.borrow().ready_tasks.is_empty();
-                    if !has_ready {
-                        break;
-                    }
+            } else {
+                // No more events - check if any tasks are ready
+                let has_ready = !self.state.borrow().ready_tasks.is_empty();
+                if !has_ready {
+                    break;
                 }
             }
         }
 
         let state = self.state.borrow();
-        stats.final_time = state.now;
-        stats.messages_dropped = state.messages_dropped;
-        stats
+        run_stats.final_time = state.now;
+        run_stats.messages_dropped = state.messages_dropped;
+        run_stats
     }
 }
 
@@ -943,14 +1086,13 @@ mod tests {
 
         let mut sim = TaskSimBuilder::<String>::new(topology, 42).build(|ctx| async move {
             let id = ctx.id().as_u32();
+            let msg = ctx.recv().await;
             if id == 0 {
-                let msg = ctx.recv().await;
                 ctx.send(NodeId(1), format!("ping from 0, got: {}", msg.payload))
                     .await;
                 let reply = ctx.recv().await;
                 assert!(reply.payload.starts_with("pong"));
             } else {
-                let msg = ctx.recv().await;
                 assert!(msg.payload.starts_with("ping"));
                 ctx.send(msg.src, "pong from 1".to_string()).await;
             }
@@ -970,7 +1112,8 @@ mod tests {
 
         let sim = TaskSimBuilder::<u32>::new(topology, 42).build(|ctx| async move {
             let id = ctx.id().as_u32();
-            ctx.sleep(Duration::from_millis((id as u64 + 1) * 10)).await;
+            ctx.sleep(Duration::from_millis((u64::from(id) + 1) * 10))
+                .await;
             let next = NodeId((id + 1) % 3);
             ctx.send(next, id).await;
             let _msg = ctx.recv().await;
@@ -1019,7 +1162,7 @@ mod tests {
             assert_eq!(ctx.now(), Time::from_millis(150));
         });
 
-        sim.run();
+        let _stats = sim.run();
     }
 
     #[test]
@@ -1319,7 +1462,7 @@ mod tests {
                 let either = select2(ctx.recv(), ctx.sleep(Duration::from_millis(100))).await;
                 match either {
                     Either::Left(env) => assert_eq!(env.payload, "hi"),
-                    Either::Right(_) => panic!("expected recv to win"),
+                    Either::Right(()) => panic!("expected recv to win"),
                 }
             }
         });
@@ -1335,7 +1478,7 @@ mod tests {
 
         let sim = TaskSimBuilder::<u32>::new(topology, 42).build(|ctx| async move {
             let either = select2(ctx.recv(), ctx.sleep(Duration::from_millis(25))).await;
-            assert!(matches!(either, Either::Right(_)));
+            assert!(matches!(either, Either::Right(())));
             assert_eq!(ctx.now(), Time::from_millis(25));
         });
 

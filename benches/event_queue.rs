@@ -4,6 +4,14 @@
 //! the raw cost of scheduling and draining events, both under interleaved
 //! times and under identical times (worst case for tie-breaking).
 
+// Benchmark harness, not load-bearing library code: loop indices and the
+// arithmetic that derives schedule times are bounded by the bench parameters.
+#![expect(
+    clippy::arithmetic_side_effects,
+    clippy::cast_possible_truncation,
+    reason = "bench harness: indices/arithmetic bounded by bench parameters"
+)]
+
 use std::hint::black_box;
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
@@ -16,7 +24,7 @@ fn bench_push_pop_interleaved(c: &mut Criterion) {
         group.bench_function(format!("n={n}"), |b| {
             b.iter_batched(
                 || (),
-                |_| {
+                |()| {
                     let mut q: EventQueue<u32> = EventQueue::with_capacity(n);
                     // Schedule at spread-out times so the heap actually reorders.
                     for i in 0..n {
@@ -28,7 +36,7 @@ fn bench_push_pop_interleaved(c: &mut Criterion) {
                     }
                 },
                 BatchSize::SmallInput,
-            )
+            );
         });
     }
     group.finish();
@@ -41,7 +49,7 @@ fn bench_push_pop_same_time(c: &mut Criterion) {
         group.bench_function(format!("n={n}"), |b| {
             b.iter_batched(
                 || (),
-                |_| {
+                |()| {
                     // All at Time::ZERO — pure tie-breaking stress.
                     let mut q: EventQueue<u32> = EventQueue::with_capacity(n);
                     for i in 0..n {
@@ -52,7 +60,7 @@ fn bench_push_pop_same_time(c: &mut Criterion) {
                     }
                 },
                 BatchSize::SmallInput,
-            )
+            );
         });
     }
     group.finish();

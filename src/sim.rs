@@ -2,6 +2,15 @@
 //!
 //! This module provides the main simulation loop and coordination.
 
+// Kernel arithmetic panics on overflow *by design*: the determinism contract
+// (DESIGN.md / README) specifies integer-only time with panic-on-overflow and
+// `saturating_*` as the documented opt-in. Flagging every `+`/`-` here is noise
+// that fights that contract.
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "documented panic-on-overflow determinism contract; see DESIGN.md"
+)]
+
 use crate::queue::{EventQueue, Scheduled};
 use crate::time::Time;
 
@@ -57,8 +66,9 @@ pub struct Simulation<E> {
 
 impl<E> Simulation<E> {
     /// Creates a new simulation starting at time zero.
-    pub fn new() -> Self {
-        Simulation {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
             now: Time::ZERO,
             queue: EventQueue::new(),
             events_processed: 0,
@@ -66,8 +76,9 @@ impl<E> Simulation<E> {
     }
 
     /// Creates a new simulation with a pre-allocated event queue capacity.
+    #[must_use]
     pub fn with_capacity(capacity: usize) -> Self {
-        Simulation {
+        Self {
             now: Time::ZERO,
             queue: EventQueue::with_capacity(capacity),
             events_processed: 0,
@@ -76,24 +87,28 @@ impl<E> Simulation<E> {
 
     /// Returns the current simulated time.
     #[inline]
-    pub fn now(&self) -> Time {
+    #[must_use]
+    pub const fn now(&self) -> Time {
         self.now
     }
 
     /// Returns the number of events processed so far.
     #[inline]
-    pub fn events_processed(&self) -> u64 {
+    #[must_use]
+    pub const fn events_processed(&self) -> u64 {
         self.events_processed
     }
 
     /// Returns the number of events currently in the queue.
     #[inline]
+    #[must_use]
     pub fn pending_events(&self) -> usize {
         self.queue.len()
     }
 
     /// Returns `true` if there are no pending events.
     #[inline]
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.queue.is_empty()
     }
@@ -134,6 +149,7 @@ impl<E> Simulation<E> {
 
     /// Returns a reference to the next scheduled event without processing it.
     #[inline]
+    #[must_use]
     pub fn peek(&self) -> Option<&Scheduled<E>> {
         self.queue.peek()
     }
@@ -280,6 +296,10 @@ mod tests {
     fn run_until_can_stop_early() {
         let mut sim = Simulation::new();
         for i in 1..=10 {
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "loop counter is 1..=10, always fits in u32"
+            )]
             sim.schedule(Time::from_millis(i * 100), TestEvent::Ping(i as u32));
         }
 

@@ -51,6 +51,12 @@ use std::thread;
 /// If any worker panics, this call will panic (via the join handle) once all
 /// workers have been joined. Results from runs that completed before the
 /// panic on other threads are discarded in that case.
+#[expect(
+    clippy::expect_used,
+    reason = "join() re-raises worker panics (documented under # Panics); the \
+              slot-fill expect is a construction invariant — every index in \
+              0..count is produced exactly once before the merge"
+)]
 pub fn run_seeds<F, T>(
     count: usize,
     base_seed: u64,
@@ -67,8 +73,7 @@ where
 
     let thread_count = threads
         .or_else(|| thread::available_parallelism().ok())
-        .map(NonZeroUsize::get)
-        .unwrap_or(1)
+        .map_or(1, NonZeroUsize::get)
         .min(count);
 
     // Shared work cursor: each worker grabs the next seed index atomically.
@@ -106,8 +111,15 @@ where
     slots.resize_with(count, || None);
     for chunk in chunks {
         for (i, v) in chunk {
-            debug_assert!(slots[i].is_none(), "index {} filled twice", i);
-            slots[i] = Some(v);
+            #[expect(
+                clippy::indexing_slicing,
+                reason = "`i` comes from the work cursor guarded by `if i >= count \
+                          { break }`, so 0 <= i < count == slots.len()"
+            )]
+            {
+                debug_assert!(slots[i].is_none(), "index {i} filled twice");
+                slots[i] = Some(v);
+            }
         }
     }
 

@@ -44,8 +44,8 @@ pub struct TraceEvent<E> {
 
 impl<E> TraceEvent<E> {
     /// Creates a new trace event.
-    pub fn new(time: Time, sequence: u64, event: E) -> Self {
-        TraceEvent {
+    pub const fn new(time: Time, sequence: u64, event: E) -> Self {
+        Self {
             time_ns: time.as_nanos(),
             sequence,
             event,
@@ -53,7 +53,7 @@ impl<E> TraceEvent<E> {
     }
 
     /// Returns the time as a `Time` value.
-    pub fn time(&self) -> Time {
+    pub const fn time(&self) -> Time {
         Time::from_nanos(self.time_ns)
     }
 }
@@ -73,8 +73,9 @@ pub struct Trace<E> {
 
 impl<E> Trace<E> {
     /// Creates a new empty trace with the given seed.
-    pub fn new(seed: u64) -> Self {
-        Trace {
+    #[must_use]
+    pub const fn new(seed: u64) -> Self {
+        Self {
             seed,
             events: Vec::new(),
             final_time_ns: 0,
@@ -82,8 +83,9 @@ impl<E> Trace<E> {
     }
 
     /// Creates a trace with pre-allocated capacity.
+    #[must_use]
     pub fn with_capacity(seed: u64, capacity: usize) -> Self {
-        Trace {
+        Self {
             seed,
             events: Vec::with_capacity(capacity),
             final_time_ns: 0,
@@ -98,17 +100,20 @@ impl<E> Trace<E> {
     }
 
     /// Returns the final simulation time.
-    pub fn final_time(&self) -> Time {
+    #[must_use]
+    pub const fn final_time(&self) -> Time {
         Time::from_nanos(self.final_time_ns)
     }
 
     /// Returns the number of recorded events.
-    pub fn len(&self) -> usize {
+    #[must_use]
+    pub const fn len(&self) -> usize {
         self.events.len()
     }
 
     /// Returns true if no events have been recorded.
-    pub fn is_empty(&self) -> bool {
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
         self.events.is_empty()
     }
 
@@ -118,11 +123,13 @@ impl<E> Trace<E> {
     }
 
     /// Returns the event at the given index.
+    #[must_use]
     pub fn get(&self, index: usize) -> Option<&TraceEvent<E>> {
         self.events.get(index)
     }
 
     /// Consumes the trace and returns the events.
+    #[must_use]
     pub fn into_events(self) -> Vec<TraceEvent<E>> {
         self.events
     }
@@ -177,13 +184,13 @@ pub enum TraceLoadError {
 impl fmt::Display for TraceLoadError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            TraceLoadError::Json(e) => write!(f, "invalid trace JSON: {e}"),
-            TraceLoadError::Io(e) => write!(f, "could not read trace file: {e}"),
-            TraceLoadError::NotASimulacraTrace => write!(
+            Self::Json(e) => write!(f, "invalid trace JSON: {e}"),
+            Self::Io(e) => write!(f, "could not read trace file: {e}"),
+            Self::NotASimulacraTrace => write!(
                 f,
                 "not a Simulacra trace (missing or wrong \"{TRACE_FORMAT}\" format tag)"
             ),
-            TraceLoadError::SchemaVersion { expected, found } => write!(
+            Self::SchemaVersion { expected, found } => write!(
                 f,
                 "unsupported trace schema version: file is v{found}, \
                  this build expects v{expected}"
@@ -196,8 +203,8 @@ impl fmt::Display for TraceLoadError {
 impl std::error::Error for TraceLoadError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            TraceLoadError::Json(e) => Some(e),
-            TraceLoadError::Io(e) => Some(e),
+            Self::Json(e) => Some(e),
+            Self::Io(e) => Some(e),
             _ => None,
         }
     }
@@ -206,14 +213,14 @@ impl std::error::Error for TraceLoadError {
 #[cfg(feature = "serde")]
 impl From<serde_json::Error> for TraceLoadError {
     fn from(e: serde_json::Error) -> Self {
-        TraceLoadError::Json(e)
+        Self::Json(e)
     }
 }
 
 #[cfg(feature = "serde")]
 impl From<std::io::Error> for TraceLoadError {
     fn from(e: std::io::Error) -> Self {
-        TraceLoadError::Io(e)
+        Self::Io(e)
     }
 }
 
@@ -230,16 +237,29 @@ impl<E: serde::Serialize> Trace<E> {
     }
 
     /// Exports the trace to a JSON string (format-tagged + versioned).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`serde_json::Error`] if the trace fails to serialize.
     pub fn to_json(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string(&self.envelope())
     }
 
     /// Exports the trace to a pretty-printed JSON string.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`serde_json::Error`] if the trace fails to serialize.
     pub fn to_json_pretty(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string_pretty(&self.envelope())
     }
 
     /// Writes the trace to a JSON file.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`std::io::Error`] if the file cannot be created or if
+    /// serialization or the underlying write fails.
     pub fn write_json(&self, path: impl AsRef<std::path::Path>) -> std::io::Result<()> {
         let file = std::fs::File::create(path)?;
         serde_json::to_writer(file, &self.envelope())?;
@@ -247,6 +267,11 @@ impl<E: serde::Serialize> Trace<E> {
     }
 
     /// Writes the trace to a pretty-printed JSON file.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`std::io::Error`] if the file cannot be created or if
+    /// serialization or the underlying write fails.
     pub fn write_json_pretty(&self, path: impl AsRef<std::path::Path>) -> std::io::Result<()> {
         let file = std::fs::File::create(path)?;
         serde_json::to_writer_pretty(file, &self.envelope())?;
@@ -266,7 +291,7 @@ impl<E: serde::de::DeserializeOwned> Trace<E> {
                 found: env.schema_version,
             });
         }
-        Ok(Trace {
+        Ok(Self {
             seed: env.seed,
             events: env.events,
             final_time_ns: env.final_time_ns,
@@ -279,12 +304,23 @@ impl<E: serde::de::DeserializeOwned> Trace<E> {
     /// ([`TraceLoadError::NotASimulacraTrace`]) and traces from a
     /// different [`TRACE_SCHEMA_VERSION`]
     /// ([`TraceLoadError::SchemaVersion`]) rather than mis-parsing them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TraceLoadError`] if the input is not valid JSON, is not a
+    /// Simulacra trace, or was written under a different schema version.
     pub fn from_json(json: &str) -> Result<Self, TraceLoadError> {
         Self::from_envelope(serde_json::from_str(json)?)
     }
 
     /// Reads a trace from a JSON file, with the same strict validation as
     /// [`Trace::from_json`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TraceLoadError`] if the file cannot be opened, does not
+    /// contain valid JSON, is not a Simulacra trace, or was written under a
+    /// different schema version.
     pub fn read_json(path: impl AsRef<std::path::Path>) -> Result<Self, TraceLoadError> {
         let file = std::fs::File::open(path)?;
         Self::from_envelope(serde_json::from_reader(file)?)
@@ -295,7 +331,12 @@ impl<E: PartialEq> Trace<E> {
     /// Compares two traces for equality.
     ///
     /// Returns `Ok(())` if traces match, or `Err` with details about the first mismatch.
-    pub fn compare(&self, other: &Trace<E>) -> Result<(), TraceMismatch> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TraceMismatch`] describing the first point of divergence:
+    /// a differing seed, length, event time, or event payload.
+    pub fn compare(&self, other: &Self) -> Result<(), TraceMismatch> {
         if self.seed != other.seed {
             return Err(TraceMismatch::SeedMismatch {
                 expected: self.seed,
@@ -330,7 +371,12 @@ impl<E: PartialEq> Trace<E> {
     ///
     /// This is a convenience wrapper around `compare()` that provides
     /// a more descriptive error message for replay validation.
-    pub fn validate_replay(&self, replay: &Trace<E>) -> Result<(), ReplayError> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReplayError`] (wrapping the underlying [`TraceMismatch`]) if
+    /// the replay diverges from this trace.
+    pub fn validate_replay(&self, replay: &Self) -> Result<(), ReplayError> {
         self.compare(replay).map_err(|mismatch| ReplayError {
             seed: self.seed,
             mismatch,
@@ -358,29 +404,27 @@ pub enum TraceMismatch {
 impl fmt::Display for TraceMismatch {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            TraceMismatch::SeedMismatch { expected, actual } => {
-                write!(f, "seed mismatch: expected {}, got {}", expected, actual)
+            Self::SeedMismatch { expected, actual } => {
+                write!(f, "seed mismatch: expected {expected}, got {actual}")
             }
-            TraceMismatch::LengthMismatch { expected, actual } => {
+            Self::LengthMismatch { expected, actual } => {
                 write!(
                     f,
-                    "length mismatch: expected {} events, got {}",
-                    expected, actual
+                    "length mismatch: expected {expected} events, got {actual}"
                 )
             }
-            TraceMismatch::TimeMismatch {
+            Self::TimeMismatch {
                 index,
                 expected,
                 actual,
             } => {
                 write!(
                     f,
-                    "time mismatch at event {}: expected {}, got {}",
-                    index, expected, actual
+                    "time mismatch at event {index}: expected {expected}, got {actual}"
                 )
             }
-            TraceMismatch::EventMismatch { index } => {
-                write!(f, "event data mismatch at index {}", index)
+            Self::EventMismatch { index } => {
+                write!(f, "event data mismatch at index {index}")
             }
         }
     }
@@ -423,15 +467,17 @@ pub struct TraceRecorder<E> {
 
 impl<E> TraceRecorder<E> {
     /// Creates a new trace recorder.
-    pub fn new(seed: u64) -> Self {
-        TraceRecorder {
+    #[must_use]
+    pub const fn new(seed: u64) -> Self {
+        Self {
             trace: Trace::new(seed),
         }
     }
 
     /// Creates a recorder with pre-allocated capacity.
+    #[must_use]
     pub fn with_capacity(seed: u64, capacity: usize) -> Self {
-        TraceRecorder {
+        Self {
             trace: Trace::with_capacity(seed, capacity),
         }
     }
@@ -442,16 +488,19 @@ impl<E> TraceRecorder<E> {
     }
 
     /// Returns the number of recorded events.
-    pub fn len(&self) -> usize {
+    #[must_use]
+    pub const fn len(&self) -> usize {
         self.trace.len()
     }
 
     /// Returns true if no events recorded.
-    pub fn is_empty(&self) -> bool {
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
         self.trace.is_empty()
     }
 
     /// Finishes recording and returns the trace.
+    #[must_use]
     pub fn finish(self) -> Trace<E> {
         self.trace
     }
@@ -504,7 +553,7 @@ mod tests {
         t2.record(Time::from_millis(100), TestEvent::A(1));
         t2.record(Time::from_millis(200), TestEvent::A(2));
 
-        assert!(t1.compare(&t2).is_ok());
+        t1.compare(&t2).unwrap();
     }
 
     #[test]
@@ -579,7 +628,7 @@ mod tests {
         let mut replay = Trace::new(42);
         replay.record(Time::from_millis(100), TestEvent::A(1));
 
-        assert!(original.validate_replay(&replay).is_ok());
+        original.validate_replay(&replay).unwrap();
 
         let mut bad_replay = Trace::new(42);
         bad_replay.record(Time::from_millis(100), TestEvent::A(2));
@@ -598,7 +647,7 @@ mod tests {
         let json = trace.to_json().unwrap();
         let parsed: Trace<TestEvent> = Trace::from_json(&json).unwrap();
 
-        assert!(trace.compare(&parsed).is_ok());
+        trace.compare(&parsed).unwrap();
     }
 
     #[cfg(feature = "serde")]

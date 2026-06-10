@@ -2,6 +2,13 @@
 //!
 //! All randomness in Simulacra is seeded and reproducible.
 
+// See `sim.rs` for the rationale: kernel arithmetic panics on overflow by the
+// documented determinism contract; `saturating_*` is the opt-in.
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "documented panic-on-overflow determinism contract; see DESIGN.md"
+)]
+
 use rand::{RngExt, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
@@ -9,7 +16,7 @@ use crate::time::Duration;
 
 /// A deterministic random number generator for simulations.
 ///
-/// Uses ChaCha8 for good statistical properties and reproducibility.
+/// Uses `ChaCha8` for good statistical properties and reproducibility.
 /// All operations are deterministic given the same seed.
 #[derive(Debug, Clone)]
 pub struct SimRng {
@@ -18,15 +25,17 @@ pub struct SimRng {
 
 impl SimRng {
     /// Creates a new RNG with the given seed.
+    #[must_use]
     pub fn new(seed: u64) -> Self {
-        SimRng {
+        Self {
             rng: ChaCha8Rng::seed_from_u64(seed),
         }
     }
 
     /// Creates a new RNG from a byte seed.
+    #[must_use]
     pub fn from_seed(seed: [u8; 32]) -> Self {
-        SimRng {
+        Self {
             rng: ChaCha8Rng::from_seed(seed),
         }
     }
@@ -67,11 +76,17 @@ impl SimRng {
         self.rng.random_range(min..max)
     }
 
-    /// Generates jitter as a duration within [-max_jitter, +max_jitter].
+    /// Generates jitter as a duration within [-`max_jitter`, +`max_jitter`].
     ///
     /// Returns a signed jitter value that can be added to a base duration.
     /// The jitter is uniformly distributed.
     pub fn jitter(&mut self, max_jitter: Duration) -> i64 {
+        #[expect(
+            clippy::cast_possible_wrap,
+            reason = "jitter is a signed offset by definition; durations in this \
+                      engine never reach i64::MAX nanoseconds (~292 years), so the \
+                      u64->i64 reinterpretation is exact and determinism-bearing"
+        )]
         let max = max_jitter.as_nanos() as i64;
         if max == 0 {
             return 0;
@@ -84,16 +99,33 @@ impl SimRng {
     /// The result is clamped to be non-negative.
     pub fn duration_with_jitter(&mut self, base: Duration, max_jitter: Duration) -> Duration {
         let jitter = self.jitter(max_jitter);
+        #[expect(
+            clippy::cast_possible_wrap,
+            reason = "base duration nanos never reach i64::MAX (~292 years) in this \
+                      engine, so the u64->i64 reinterpretation is exact"
+        )]
         let base_nanos = base.as_nanos() as i64;
+        #[expect(
+            clippy::cast_sign_loss,
+            reason = "`.max(0)` clamps to non-negative before the i64->u64 cast, so \
+                      no sign information is lost; result is the clamped jitter"
+        )]
         let result = (base_nanos + jitter).max(0) as u64;
         Duration::from_nanos(result)
     }
 
     /// Selects a random element from a slice.
     ///
-    /// Panics if the slice is empty.
+    /// # Panics
+    ///
+    /// Panics if `items` is empty.
     pub fn choice<'a, T>(&mut self, items: &'a [T]) -> &'a T {
         assert!(!items.is_empty(), "cannot choose from empty slice");
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "`self.usize(n)` returns a value in 0..n and the slice is \
+                      asserted non-empty just above, so the index is in bounds"
+        )]
         &items[self.usize(items.len())]
     }
 
@@ -109,10 +141,11 @@ impl SimRng {
     ///
     /// Useful for creating independent RNG streams for different concerns
     /// (e.g., separate streams for jitter, failures, workload generation).
-    pub fn fork(&mut self) -> SimRng {
+    #[must_use]
+    pub fn fork(&mut self) -> Self {
         let mut seed = [0u8; 32];
         self.rng.fill(&mut seed);
-        SimRng::from_seed(seed)
+        Self::from_seed(seed)
     }
 }
 
@@ -169,7 +202,7 @@ mod tests {
             let result = rng.duration_with_jitter(base, max_jitter);
             // `as_nanos()` returns u64 so non-negativity is implicit; this
             // test is really checking the call does not panic.
-            let _ = result.as_nanos();
+            assert!(result.as_nanos() < u64::MAX);
         }
     }
 
@@ -253,36 +286,39 @@ mod tests {
     fn golden_stream_is_stable_across_dep_versions() {
         let mut rng = SimRng::new(42);
 
-        let u: Vec<u64> = (0..8).map(|_| rng.u64(1_000_000)).collect();
+        let u64_stream: Vec<u64> = (0..8).map(|_| rng.u64(1_000_000)).collect();
         assert_eq!(
-            u,
+            u64_stream,
             [
-                681896, 950275, 427516, 627360, 288593, 149958, 308040, 803872
+                681_896, 950_275, 427_516, 627_360, 288_593, 149_958, 308_040, 803_872
             ],
             "u64 range stream (random_range over integers) changed"
         );
 
-        let f: Vec<u64> = (0..4).map(|_| rng.f64().to_bits()).collect();
+        let f64_stream: Vec<u64> = (0..4).map(|_| rng.f64().to_bits()).collect();
         assert_eq!(
-            f,
+            f64_stream,
             [
-                4605122010988943809,
-                4597763960352646552,
-                4602740670442056384,
-                4606297940404477195
+                4_605_122_010_988_943_809,
+                4_597_763_960_352_646_552,
+                4_602_740_670_442_056_384,
+                4_606_297_940_404_477_195
             ],
             "f64 stream (random::<f64>() bit pattern) changed"
         );
 
-        let b: u32 = (0..16).fold(0u32, |acc, i| acc | ((rng.bool(0.5) as u32) << i));
-        assert_eq!(b, 0x3be8, "bool(0.5) stream (random_bool) changed");
+        let bool_stream: u32 = (0..16).fold(0u32, |acc, i| acc | (u32::from(rng.bool(0.5)) << i));
+        assert_eq!(
+            bool_stream, 0x3be8,
+            "bool(0.5) stream (random_bool) changed"
+        );
 
-        let j: Vec<i64> = (0..4)
+        let jitter_stream: Vec<i64> = (0..4)
             .map(|_| rng.jitter(Duration::from_millis(10)))
             .collect();
         assert_eq!(
-            j,
-            [3440136, 3642442, 3485106, -8003166],
+            jitter_stream,
+            [3_440_136, 3_642_442, 3_485_106, -8_003_166],
             "signed jitter stream (random_range over a signed range) changed"
         );
 
@@ -297,10 +333,10 @@ mod tests {
         // fork() derives the child seed via `fill()` — the surface most
         // likely to shift on a rand major bump.
         let mut child = SimRng::new(42).fork();
-        let c: Vec<u64> = (0..4).map(|_| child.u64(1_000_000)).collect();
+        let child_stream: Vec<u64> = (0..4).map(|_| child.u64(1_000_000)).collect();
         assert_eq!(
-            c,
-            [999698, 281675, 181238, 337832],
+            child_stream,
+            [999_698, 281_675, 181_238, 337_832],
             "forked sub-stream changed (fill()-based seed derivation)"
         );
     }
@@ -321,10 +357,6 @@ mod tests {
 
         // With probability 0.5, should be roughly half true
         let count = (0..10000).filter(|_| rng.bool(0.5)).count();
-        assert!(
-            count > 4500 && count < 5500,
-            "expected ~5000, got {}",
-            count
-        );
+        assert!(count > 4500 && count < 5500, "expected ~5000, got {count}");
     }
 }

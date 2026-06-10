@@ -44,8 +44,9 @@ pub struct Scenario<M: Clone + 'static> {
 
 impl<M: Clone + 'static> Scenario<M> {
     /// Creates a new scenario with the given topology and seed.
-    pub fn new(topology: Topology, seed: u64) -> Self {
-        Scenario {
+    #[must_use]
+    pub const fn new(topology: Topology, seed: u64) -> Self {
+        Self {
             topology,
             seed,
             injections: Vec::new(),
@@ -54,6 +55,7 @@ impl<M: Clone + 'static> Scenario<M> {
     }
 
     /// Queues a message to be injected at `Time::ZERO`, before any task runs.
+    #[must_use]
     pub fn inject(mut self, src: NodeId, dst: NodeId, payload: M) -> Self {
         self.injections.push((src, dst, payload));
         self
@@ -61,8 +63,15 @@ impl<M: Clone + 'static> Scenario<M> {
 
     /// Limits the run to `duration` of simulated time. The simulation still
     /// stops earlier if it runs out of events and pending tasks.
+    #[must_use]
     pub fn run_for(mut self, duration: Duration) -> Self {
-        self.run_until = Some(Time::ZERO + duration);
+        #[expect(
+            clippy::arithmetic_side_effects,
+            reason = "`Time + Duration` is internally `checked_add().expect(\"time \
+                      overflow\")`; panic on overflow is the documented time contract"
+        )]
+        let bound = Time::ZERO + duration;
+        self.run_until = Some(bound);
         self
     }
 
@@ -74,7 +83,7 @@ impl<M: Clone + 'static> Scenario<M> {
         F: Fn(NodeContext<M>) -> Fut,
         Fut: Future<Output = ()> + 'static,
     {
-        let Scenario {
+        let Self {
             topology,
             seed,
             injections,
