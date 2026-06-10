@@ -221,6 +221,7 @@ impl<P, L: LatencyModel> TracedNetwork<P, L> {
     }
 
     /// Runs the simulation with tracing, returning both stats and trace.
+    #[must_use]
     pub fn run_traced<F>(self, mut handler: F) -> (NetworkStats, Trace<NetTraceEvent>)
     where
         F: FnMut(&mut crate::net::RunContext<P, L>, &NetEvent<P>),

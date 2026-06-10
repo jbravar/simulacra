@@ -38,6 +38,7 @@ use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use crate::net::{NodeId, Topology};
 use crate::queue::EventQueue;
 use crate::time::{Duration, Time};
+use crate::trace::{Trace, TraceRecorder};
 
 /// Canonical ordering for an unordered node pair, used as the key for
 /// symmetric partition tracking. Mirrors the helper used in `net::mod`.
@@ -66,6 +67,50 @@ pub struct Envelope<M> {
     pub sent_at: Time,
     /// Time the message was received.
     pub received_at: Time,
+}
+
+/// A simplified trace event for task-based simulations.
+///
+/// Mirrors [`crate::net::NetTraceEvent`] for the async task layer: it captures
+/// message deliveries and drops without requiring the payload `M` to be `Clone`
+/// or `Serialize`. Events are recorded only when the simulation is built with
+/// [`TaskSimBuilder::with_trace`] (or run via [`TaskSim::run_traced`] /
+/// [`TaskSim::run_until_traced`]), in the exact order they occur during the run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum TaskTraceEvent {
+    /// A message landed in the destination node's inbox.
+    Delivered {
+        /// Source node.
+        src: u32,
+        /// Destination node.
+        dst: u32,
+    },
+    /// A message was dropped instead of delivered.
+    Dropped {
+        /// Source node.
+        src: u32,
+        /// Destination node.
+        dst: u32,
+        /// Why the message was dropped.
+        reason: TaskTraceDropReason,
+    },
+}
+
+/// Why a task-layer message was dropped.
+///
+/// The async task facade drops a send when its destination is unreachable at
+/// send time. Unlike the [`Network`](crate::net::Network) layer, the task
+/// facade has no random packet loss or per-link buffers, so only these two
+/// reasons can occur.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum TaskTraceDropReason {
+    /// No route from source to destination — also covers a failed link or
+    /// node on the only path, since routing simply finds no path.
+    NoRoute,
+    /// An active partition blocks the source/destination pair.
+    Partitioned,
 }
 
 /// Internal events for the task simulation.
@@ -113,11 +158,46 @@ struct SimState<M> {
     /// Running count of messages that were dropped (no route or
     /// partition) instead of delivered.
     messages_dropped: u64,
+    /// Optional trace recorder. `Some` once the sim has been built with
+    /// [`TaskSimBuilder::with_trace`] (or lazily enabled by
+    /// [`TaskSim::run_until_traced`]). A pure observer: it is read by nothing
+    /// in the engine, so recording cannot affect scheduling, RNG, or event
+    /// ordering, and therefore cannot affect determinism.
+    trace: Option<TraceRecorder<TaskTraceEvent>>,
 }
 
 impl<M> SimState<M> {
     fn schedule_wake(&mut self, time: Time, task_id: TaskId) {
         self.events.schedule(time, TaskEvent::Wake(task_id));
+    }
+
+    /// Records a delivery into the optional trace recorder, at the current
+    /// simulated time. No-op when tracing is disabled.
+    fn record_delivered(&mut self, src: NodeId, dst: NodeId) {
+        if let Some(recorder) = self.trace.as_mut() {
+            recorder.record(
+                self.now,
+                TaskTraceEvent::Delivered {
+                    src: src.as_u32(),
+                    dst: dst.as_u32(),
+                },
+            );
+        }
+    }
+
+    /// Records a drop into the optional trace recorder, at the current
+    /// simulated time. No-op when tracing is disabled.
+    fn record_drop(&mut self, src: NodeId, dst: NodeId, reason: TaskTraceDropReason) {
+        if let Some(recorder) = self.trace.as_mut() {
+            recorder.record(
+                self.now,
+                TaskTraceEvent::Dropped {
+                    src: src.as_u32(),
+                    dst: dst.as_u32(),
+                    reason,
+                },
+            );
+        }
     }
 }
 
@@ -477,6 +557,7 @@ impl<M: Clone + 'static> Future for SendFut<M> {
                 {
                     state.messages_dropped += 1;
                 }
+                state.record_drop(this.src, this.dst, TaskTraceDropReason::Partitioned);
                 return Poll::Ready(());
             }
 
@@ -489,6 +570,7 @@ impl<M: Clone + 'static> Future for SendFut<M> {
                 {
                     state.messages_dropped += 1;
                 }
+                state.record_drop(this.src, this.dst, TaskTraceDropReason::NoRoute);
                 return Poll::Ready(());
             };
 
@@ -603,6 +685,7 @@ fn create_waker() -> Waker {
 pub struct TaskSimBuilder<M: 'static> {
     topology: Topology,
     seed: u64,
+    trace_enabled: bool,
     _phantom: std::marker::PhantomData<M>,
 }
 
@@ -613,8 +696,26 @@ impl<M: 'static> TaskSimBuilder<M> {
         Self {
             topology,
             seed,
+            trace_enabled: false,
             _phantom: std::marker::PhantomData,
         }
+    }
+
+    /// Enables trace recording for the built simulation.
+    ///
+    /// When set, the [`TaskSim`] records a [`TaskTraceEvent`] for every
+    /// delivery and drop — including drops from [`TaskSim::inject`] calls made
+    /// before the run — retrievable via [`TaskSim::run_traced`] /
+    /// [`TaskSim::run_until_traced`]. Without it, those run methods still
+    /// produce a trace, but any injection-time drops that happened before the
+    /// run are not captured.
+    ///
+    /// The recorded trace is only returned by the `*_traced` run methods; a
+    /// plain [`TaskSim::run`] / [`TaskSim::run_until`] discards it.
+    #[must_use]
+    pub const fn with_trace(mut self) -> Self {
+        self.trace_enabled = true;
+        self
     }
 
     /// Builds the simulation with the given node function.
@@ -652,6 +753,11 @@ impl<M: 'static> TaskSimBuilder<M> {
             cancelled: Rc::new(Cell::new(false)),
             partitions: HashSet::new(),
             messages_dropped: 0,
+            trace: if self.trace_enabled {
+                Some(TraceRecorder::new(self.seed))
+            } else {
+                None
+            },
         }));
 
         // Create tasks for each node
@@ -752,6 +858,7 @@ impl<M: Clone + 'static> TaskSim<M> {
             {
                 state.messages_dropped += 1;
             }
+            state.record_drop(src, dst, TaskTraceDropReason::Partitioned);
             return;
         }
 
@@ -764,6 +871,7 @@ impl<M: Clone + 'static> TaskSim<M> {
             {
                 state.messages_dropped += 1;
             }
+            state.record_drop(src, dst, TaskTraceDropReason::NoRoute);
             return;
         };
 
@@ -996,14 +1104,20 @@ impl<M: Clone + 'static> TaskSim<M> {
                                     state.ready_tasks.push(task_id);
                                 }
                             }
-                        }
-                        #[expect(
-                            clippy::arithmetic_side_effects,
-                            reason = "monotonic u64 delivered-message counter; 2^64 \
-                                      deliveries is physically unreachable"
-                        )]
-                        {
-                            run_stats.messages_delivered += 1;
+                            // Count and record only deliveries that actually
+                            // reach an inbox, so `messages_delivered` stays equal
+                            // to the number of `Delivered` trace events. An
+                            // out-of-range `dst` (reachable only via a degenerate
+                            // out-of-bounds self-inject) is a true no-op here.
+                            #[expect(
+                                clippy::arithmetic_side_effects,
+                                reason = "monotonic u64 delivered-message counter; 2^64 \
+                                          deliveries is physically unreachable"
+                            )]
+                            {
+                                run_stats.messages_delivered += 1;
+                            }
+                            state.record_delivered(src, dst);
                         }
                     }
                 }
@@ -1020,6 +1134,52 @@ impl<M: Clone + 'static> TaskSim<M> {
         run_stats.final_time = state.now;
         run_stats.messages_dropped = state.messages_dropped;
         run_stats
+    }
+
+    /// Runs the simulation to completion, returning both the run stats and a
+    /// recorded [`Trace`] of every delivery and drop.
+    ///
+    /// Equivalent to [`Self::run`] plus trace capture. For a trace that also
+    /// includes drops from pre-run [`Self::inject`] calls, build the sim with
+    /// [`TaskSimBuilder::with_trace`] before injecting; otherwise tracing is
+    /// enabled here and only events from the run itself are captured.
+    #[must_use]
+    pub fn run_traced(self) -> (TaskSimStats, Trace<TaskTraceEvent>) {
+        self.run_until_traced(|_| true)
+    }
+
+    /// Like [`Self::run_until`], but also returns a recorded [`Trace`] of
+    /// every delivery and drop. See [`Self::run_traced`] for the note on
+    /// capturing injection-time drops.
+    #[must_use]
+    pub fn run_until_traced<F>(self, continue_fn: F) -> (TaskSimStats, Trace<TaskTraceEvent>)
+    where
+        F: FnMut(Time) -> bool,
+    {
+        let state = Rc::clone(&self.state);
+        let seed = self.seed;
+        // Ensure a recorder exists even if the builder did not enable one, so
+        // run-time events are always captured.
+        {
+            let mut s = state.borrow_mut();
+            if s.trace.is_none() {
+                s.trace = Some(TraceRecorder::new(seed));
+            }
+        }
+
+        // Named `run_stats` (not `stats`) to stay clear of the `state` binding
+        // above — matching the convention inside `run_until`.
+        let run_stats = self.run_until(continue_fn);
+
+        // The recorder is `Some` here (enabled above or at build); the
+        // `Trace::new` fallback is unreachable but keeps this off `unwrap`.
+        let mut trace = state
+            .borrow_mut()
+            .trace
+            .take()
+            .map_or_else(|| Trace::new(seed), TraceRecorder::finish);
+        trace.final_time_ns = run_stats.final_time.as_nanos();
+        (run_stats, trace)
     }
 }
 
@@ -1511,5 +1671,137 @@ mod tests {
         let stats = sim.run();
         assert_eq!(stats.tasks_completed, 2);
         assert_eq!(stats.messages_delivered, 0);
+    }
+
+    #[test]
+    fn traced_run_records_delivery() {
+        let topology = TopologyBuilder::new(2)
+            .link(0u32, 1u32, Duration::from_millis(10))
+            .build();
+
+        let sim = TaskSimBuilder::<u64>::new(topology, 7)
+            .with_trace()
+            .build(|ctx| async move {
+                if ctx.id() == NodeId(0) {
+                    ctx.send(NodeId(1), 42).await;
+                }
+            });
+
+        let (stats, trace) = sim.run_traced();
+
+        assert_eq!(stats.messages_delivered, 1);
+        assert_eq!(trace.seed, 7);
+        assert_eq!(trace.len(), 1);
+        assert_eq!(
+            trace.get(0).map(|e| e.event.clone()),
+            Some(TaskTraceEvent::Delivered { src: 0, dst: 1 })
+        );
+    }
+
+    #[test]
+    fn traced_run_records_noroute_drop() {
+        // No links: the send from node 0 has no route and is recorded as a
+        // drop rather than a delivery.
+        let topology = TopologyBuilder::new(2).build();
+
+        let sim = TaskSimBuilder::<u64>::new(topology, 1)
+            .with_trace()
+            .build(|ctx| async move {
+                if ctx.id() == NodeId(0) {
+                    ctx.send(NodeId(1), 1).await;
+                }
+            });
+
+        let (stats, trace) = sim.run_traced();
+
+        assert_eq!(stats.messages_delivered, 0);
+        assert_eq!(stats.messages_dropped, 1);
+        assert_eq!(trace.len(), 1);
+        assert_eq!(
+            trace.get(0).map(|e| e.event.clone()),
+            Some(TaskTraceEvent::Dropped {
+                src: 0,
+                dst: 1,
+                reason: TaskTraceDropReason::NoRoute,
+            })
+        );
+    }
+
+    #[test]
+    fn traced_inject_drop_is_recorded() {
+        // A pre-run inject to an unreachable node drops; because tracing was
+        // enabled (with_trace) before the inject, that drop is captured.
+        let topology = TopologyBuilder::new(2).build();
+
+        let mut sim = TaskSimBuilder::<u64>::new(topology, 1)
+            .with_trace()
+            .build(|_ctx| async move {});
+
+        sim.inject(NodeId(0), NodeId(1), 99);
+        let (stats, trace) = sim.run_traced();
+
+        assert_eq!(stats.messages_dropped, 1);
+        assert_eq!(trace.len(), 1);
+        assert!(matches!(
+            trace.get(0).map(|e| &e.event),
+            Some(TaskTraceEvent::Dropped {
+                reason: TaskTraceDropReason::NoRoute,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn tracing_does_not_change_behavior() {
+        // The recorder is a pure observer: a traced run and an untraced run of
+        // the same scenario must produce identical stats. (The trace itself
+        // being deterministic across runs is covered in tests/determinism.rs.)
+        fn scenario(trace: bool) -> TaskSimStats {
+            let topology = TopologyBuilder::new(3)
+                .link(0u32, 1u32, Duration::from_millis(5))
+                .link(1u32, 2u32, Duration::from_millis(5))
+                .build();
+            let builder = TaskSimBuilder::<u64>::new(topology, 99);
+            let builder = if trace { builder.with_trace() } else { builder };
+            let sim = builder.build(|ctx| async move {
+                if ctx.id() == NodeId(0) {
+                    ctx.send(NodeId(2), 1).await;
+                    ctx.sleep(Duration::from_millis(3)).await;
+                    ctx.send(NodeId(2), 2).await;
+                }
+            });
+            sim.run()
+        }
+
+        let untraced = scenario(false);
+        let traced = scenario(true);
+        assert_eq!(untraced.messages_delivered, traced.messages_delivered);
+        assert_eq!(untraced.messages_dropped, traced.messages_dropped);
+        assert_eq!(untraced.events_processed, traced.events_processed);
+        assert_eq!(untraced.task_polls, traced.task_polls);
+        assert_eq!(untraced.tasks_completed, traced.tasks_completed);
+        assert_eq!(untraced.final_time, traced.final_time);
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn task_trace_json_round_trip() {
+        let topology = TopologyBuilder::new(2)
+            .link(0u32, 1u32, Duration::from_millis(10))
+            .build();
+
+        let sim = TaskSimBuilder::<u64>::new(topology, 7)
+            .with_trace()
+            .build(|ctx| async move {
+                if ctx.id() == NodeId(0) {
+                    ctx.send(NodeId(1), 42).await;
+                }
+            });
+
+        let (_stats, trace) = sim.run_traced();
+
+        let json = trace.to_json().unwrap();
+        let parsed: Trace<TaskTraceEvent> = Trace::from_json(&json).unwrap();
+        trace.compare(&parsed).unwrap();
     }
 }

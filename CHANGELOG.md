@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Task-layer trace export.** The async `TaskSim` facade can now record a
+  replayable trace, reaching parity with `TracedNetwork`. Build with
+  `TaskSimBuilder::with_trace`, then run via `TaskSim::run_traced` /
+  `run_until_traced` to get `(TaskSimStats, Trace<TaskTraceEvent>)`.
+  `TaskTraceEvent` captures `Delivered` and `Dropped { reason }`
+  (`TaskTraceDropReason` is `NoRoute` / `Partitioned`) and reuses the existing
+  trace envelope — no `TRACE_SCHEMA_VERSION` bump. Recording is a pure
+  observer with no effect on scheduling, RNG, or event ordering. The
+  `tests/determinism.rs` guardrail gained a task-layer scenario that is
+  byte-identical across runs.
+
 ### Changed
 
 - Hardened the clippy lint policy: enabled the `pedantic` and `nursery` groups
@@ -22,6 +35,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `#[must_use]` to constructors, accessors, builder-by-value methods, and the
   task futures. These are forward-compatible additions to the public API with
   no behavioral change.
+
+### Fixed
+
+- `TaskSimStats::messages_delivered` now counts only deliveries that actually
+  reach an inbox, so it always equals the number of `Delivered` task-trace
+  events. Previously a `Deliver` event with an out-of-range destination — only
+  reachable via a degenerate out-of-bounds self-`inject` — was over-counted; it
+  is now a no-op.
 
 ### Documentation
 

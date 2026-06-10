@@ -20,7 +20,8 @@
 )]
 
 use simulacra::{
-    Duration, NetConfig, NetEvent, NodeId, TopologyBuilder, TracedNetwork, UniformJitter,
+    Duration, NetConfig, NetEvent, NodeId, TaskSimBuilder, TopologyBuilder, TracedNetwork,
+    UniformJitter,
 };
 
 /// A deliberately non-trivial scenario: 20-node ring, jitter + packet loss,
@@ -306,6 +307,76 @@ fn drop_in_flight_scenario_actually_drops_messages() {
     let trace = run_drop_in_flight_scenario(0xFEED);
     assert_eq!(trace.matches("\"Partitioned\"").count(), 5);
     assert_eq!(trace.matches("\"Delivered\"").count(), 1);
+}
+
+/// Task-layer (async `TaskSim`) determinism scenario. The async facade has
+/// its own event queue and trace path, separate from `TracedNetwork`; this is
+/// the guardrail for that path. A single driver node (0) on a triangle drives
+/// the whole failure surface from inside its task: a healthy delivery, a
+/// mid-run `fail_link` pair that forces a `NoRoute` drop, then a `heal_link`
+/// pair that restores delivery — recorded via `TaskSimBuilder::with_trace`.
+fn run_task_scenario(seed: u64) -> String {
+    let topology = TopologyBuilder::new(3)
+        .link(0u32, 1u32, Duration::from_millis(5))
+        .link(1u32, 2u32, Duration::from_millis(5))
+        .link(0u32, 2u32, Duration::from_millis(50))
+        .build();
+
+    let sim = TaskSimBuilder::<u64>::new(topology, seed)
+        .with_trace()
+        .build(|ctx| async move {
+            // Only node 0 acts; the others' tasks complete immediately but
+            // still receive (and so get recorded as) deliveries.
+            if ctx.id().as_u32() == 0 {
+                // Healthy: 0->2 routes via the fast 0-1-2 path (10ms).
+                ctx.send(NodeId(2), 100).await;
+                ctx.sleep(Duration::from_millis(20)).await;
+
+                // Fail both of node 0's edges: 0->2 now has no route.
+                ctx.fail_link(NodeId(0), NodeId(1));
+                ctx.fail_link(NodeId(0), NodeId(2));
+                ctx.send(NodeId(2), 200).await; // NoRoute drop at t=20ms
+
+                ctx.sleep(Duration::from_millis(20)).await;
+
+                // Heal both edges: 0->2 is deliverable again.
+                ctx.heal_link(NodeId(0), NodeId(1));
+                ctx.heal_link(NodeId(0), NodeId(2));
+                ctx.send(NodeId(2), 300).await; // delivered at t=50ms
+            }
+        });
+
+    let (_stats, trace) = sim.run_traced();
+    trace
+        .to_json()
+        .expect("task trace should serialize to JSON cleanly")
+}
+
+#[test]
+fn task_scenario_is_byte_equal_across_runs() {
+    let a = run_task_scenario(0xABCD);
+    let b = run_task_scenario(0xABCD);
+    assert_eq!(
+        a, b,
+        "two task-sim runs with the same seed produced different JSON traces; \
+         task-layer determinism has regressed"
+    );
+}
+
+#[test]
+fn task_scenario_includes_delivery_and_noroute_drop() {
+    // The scenario must exercise both sides of the task trace: real
+    // deliveries and a NoRoute drop while node 0 is fully cut off.
+    let trace = run_task_scenario(0xABCD);
+    assert!(
+        trace.contains("\"NoRoute\""),
+        "expected a NoRoute drop after both of node 0's links failed: {trace}"
+    );
+    let delivered = trace.matches("\"Delivered\"").count();
+    assert_eq!(
+        delivered, 2,
+        "expected exactly 2 deliveries (messages 100 and 300); got {delivered}"
+    );
 }
 
 /// Coarse shape check on the emitted trace.

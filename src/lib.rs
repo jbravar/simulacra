@@ -76,5 +76,5 @@ pub use net::{
 // Re-export task types
 pub use task::{
     CancellationToken, Either, Envelope, NodeContext, Recv, RecvTimeout, Select2, SendFut, Sleep,
-    TaskId, TaskSim, TaskSimBuilder, TaskSimStats, select2,
+    TaskId, TaskSim, TaskSimBuilder, TaskSimStats, TaskTraceDropReason, TaskTraceEvent, select2,
 };

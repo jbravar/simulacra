@@ -432,12 +432,15 @@ Concrete next moves, ordered by rough effort, smallest first.
    actually populates `failed_links` / `failed_nodes` / `partitions`
    (e.g., 10% of edges failed) so future regressions on the failure
    hot path become visible. Add a column to `docs/perf-baseline.md`.
-2. **Task-layer trace export.** `TaskSim` has its own `SimState` and
-   `EventQueue<TaskEvent<M>>`, separate from `Network`'s
-   `TracedNetwork`. Determinism tests today only cover the `Network`
-   path. Add a `TracedTaskSim<M>` (or `TaskSimBuilder::with_trace`)
-   that records `Delivered` / `Dropped` events with timestamps, then
-   add a task-layer scenario to `tests/determinism.rs`.
+2. **Task-layer trace export.** _Landed 2026-06-10._ `TaskSimBuilder::with_trace`
+   plus `TaskSim::run_traced` / `run_until_traced` record `TaskTraceEvent`
+   (`Delivered` / `Dropped { reason }`) into the existing `Trace<E>` envelope
+   (no schema bump). The recorder is an `Option<TraceRecorder>` inside
+   `SimState` — a pure observer, asserted behavior-neutral by
+   `tracing_does_not_change_behavior`. `tests/determinism.rs` gained a
+   task-layer scenario (`task_scenario_*`) that is byte-equal across runs.
+   The drop reasons are only `NoRoute` / `Partitioned` — the task layer has no
+   packet loss or per-link buffers (that arrives with the congestion bridge).
 3. **Time-bounded failure scheduler helper.** A common pattern is
    "fail at T1, heal at T2." Today users implement it inline by
    checking `ctx.now()` on each handler tick (see
