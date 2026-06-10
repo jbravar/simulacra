@@ -435,6 +435,75 @@ fn task_drop_in_flight_drops_all_pending() {
     );
 }
 
+/// Task-layer scheduled-failure scenario. Drives the whole failure surface
+/// declaratively via `TaskSim::schedule_failure` (the engine under
+/// `Scenario::fail_at`) instead of from inside node tasks: both of node 0's
+/// edges fail at t=10ms and heal at t=40ms. Node 0 sends before the failure
+/// (delivered), during the outage (`NoRoute` drop), and after the heal
+/// (delivered).
+fn run_task_scheduled_failure_scenario(seed: u64) -> String {
+    use simulacra::{FailureAction, Time};
+
+    let topology = TopologyBuilder::new(3)
+        .link(0u32, 1u32, Duration::from_millis(5))
+        .link(1u32, 2u32, Duration::from_millis(5))
+        .link(0u32, 2u32, Duration::from_millis(50))
+        .build();
+
+    let mut sim = TaskSimBuilder::<u64>::new(topology, seed)
+        .with_trace()
+        .build(|ctx| async move {
+            if ctx.id() == NodeId(0) {
+                ctx.send(NodeId(2), 1).await; // t=0: delivered
+                ctx.sleep(Duration::from_millis(20)).await;
+                ctx.send(NodeId(2), 2).await; // t=20: cut off -> NoRoute drop
+                ctx.sleep(Duration::from_millis(30)).await;
+                ctx.send(NodeId(2), 3).await; // t=50: healed -> delivered
+            }
+        });
+
+    for (a, b) in [(0u32, 1u32), (0, 2)] {
+        sim.schedule_failure(
+            Time::from_millis(10),
+            FailureAction::FailLink(NodeId(a), NodeId(b)),
+        );
+        sim.schedule_failure(
+            Time::from_millis(40),
+            FailureAction::HealLink(NodeId(a), NodeId(b)),
+        );
+    }
+
+    let (_stats, trace) = sim.run_traced();
+    trace
+        .to_json()
+        .expect("task scheduled-failure trace should serialize to JSON cleanly")
+}
+
+#[test]
+fn task_scheduled_failure_is_byte_equal_across_runs() {
+    let a = run_task_scheduled_failure_scenario(0x5151);
+    let b = run_task_scheduled_failure_scenario(0x5151);
+    assert_eq!(
+        a, b,
+        "two scheduled-failure runs with the same seed produced different JSON \
+         traces; the ApplyFailure event path is non-deterministic"
+    );
+}
+
+#[test]
+fn task_scheduled_failure_includes_drop_and_recovery() {
+    let trace = run_task_scheduled_failure_scenario(0x5151);
+    assert!(
+        trace.contains("\"NoRoute\""),
+        "expected a NoRoute drop during the scheduled outage"
+    );
+    assert_eq!(
+        trace.matches("\"Delivered\"").count(),
+        2,
+        "expected deliveries before the failure and after the heal"
+    );
+}
+
 /// Coarse shape check on the emitted trace.
 ///
 /// If the trace format, seed serialization, or number of events changes,

@@ -113,6 +113,50 @@ pub enum TaskTraceDropReason {
     Partitioned,
 }
 
+/// A topology or partition mutation that can be scheduled to fire at a fixed
+/// simulated time (see [`TaskSim::schedule_failure`] / [`Scenario::fail_at`]).
+///
+/// Each variant maps to the same-named imperative mutator on [`NodeContext`] /
+/// [`TaskSim`]; scheduling them turns the common "fail at T1, heal at T2"
+/// pattern into declarative data instead of hand-rolled `ctx.now()` checks.
+/// The failure-introducing variants honor
+/// [`TaskSimBuilder::drop_in_flight_on_failure`].
+///
+/// [`Scenario::fail_at`]: crate::Scenario::fail_at
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureAction {
+    /// Install a symmetric partition between two nodes.
+    Partition(NodeId, NodeId),
+    /// Remove a symmetric partition.
+    Heal(NodeId, NodeId),
+    /// Fail the bidirectional link between two nodes.
+    FailLink(NodeId, NodeId),
+    /// Restore a failed bidirectional link.
+    HealLink(NodeId, NodeId),
+    /// Fail a single direction of a link (`src -> dst`).
+    FailLinkDirected(NodeId, NodeId),
+    /// Restore a single direction of a link (`src -> dst`).
+    HealLinkDirected(NodeId, NodeId),
+    /// Fail a node (excluded from routing as src, dst, or hop).
+    FailNode(NodeId),
+    /// Restore a failed node.
+    HealNode(NodeId),
+}
+
+impl FailureAction {
+    /// Whether this action introduces a failure (and so can strand in-flight
+    /// messages), as opposed to healing one.
+    const fn is_failure(self) -> bool {
+        matches!(
+            self,
+            Self::Partition(..)
+                | Self::FailLink(..)
+                | Self::FailLinkDirected(..)
+                | Self::FailNode(..)
+        )
+    }
+}
+
 /// Internal events for the task simulation.
 #[derive(Debug)]
 enum TaskEvent<M> {
@@ -125,6 +169,8 @@ enum TaskEvent<M> {
         payload: M,
         sent_at: Time,
     },
+    /// Apply a scheduled topology/partition mutation at this time.
+    ApplyFailure(FailureAction),
 }
 
 /// Shared state for a node, accessible by its task.
@@ -210,7 +256,7 @@ fn sweep_in_flight_drops<M>(
                 ))
             }
         }
-        wake @ TaskEvent::Wake(_) => Some((scheduled.time, wake)),
+        keep @ (TaskEvent::Wake(_) | TaskEvent::ApplyFailure(_)) => Some((scheduled.time, keep)),
     });
     // Canonicalize the recorded-drop order by node pair so the trace does not
     // depend on the heap's internal drain order.
@@ -270,6 +316,34 @@ impl<M> SimState<M> {
                     reason,
                 },
             );
+        }
+    }
+
+    /// Applies a scheduled [`FailureAction`] to the topology / partition state,
+    /// then sweeps in-flight messages if it introduced a failure. Invoked when
+    /// an `ApplyFailure` event is processed.
+    fn apply_failure(&mut self, action: FailureAction) {
+        match action {
+            FailureAction::Partition(a, b) => {
+                self.partitions.insert(pair_key(a, b));
+            }
+            FailureAction::Heal(a, b) => {
+                self.partitions.remove(&pair_key(a, b));
+            }
+            FailureAction::FailLink(a, b) => self.topology.fail_link(a, b),
+            FailureAction::HealLink(a, b) => self.topology.heal_link(a, b),
+            FailureAction::FailLinkDirected(src, dst) => {
+                self.topology.fail_link_directed(src, dst);
+            }
+            FailureAction::HealLinkDirected(src, dst) => {
+                self.topology.heal_link_directed(src, dst);
+            }
+            FailureAction::FailNode(node) => self.topology.fail_node(node),
+            FailureAction::HealNode(node) => self.topology.heal_node(node),
+        }
+        // Only failures can strand in-flight messages; heals never do.
+        if action.is_failure() {
+            self.maybe_sweep_in_flight();
         }
     }
 }
@@ -996,6 +1070,21 @@ impl<M: Clone + 'static> TaskSim<M> {
         );
     }
 
+    /// Schedules a [`FailureAction`] to be applied at simulated time `time`.
+    ///
+    /// When the event fires, the topology / partition mutation is applied (and
+    /// in-flight messages are swept if it is a failure and
+    /// [`TaskSimBuilder::drop_in_flight_on_failure`] is set). This is the
+    /// declarative alternative to a node task polling `ctx.now()` to drive
+    /// failures by hand; [`Scenario::fail_at`](crate::Scenario::fail_at) wraps
+    /// it.
+    pub fn schedule_failure(&mut self, time: Time, action: FailureAction) {
+        self.state
+            .borrow_mut()
+            .events
+            .schedule(time, TaskEvent::ApplyFailure(action));
+    }
+
     /// Returns the seed used for this simulation.
     #[must_use]
     pub const fn seed(&self) -> u64 {
@@ -1182,6 +1271,9 @@ impl<M: Clone + 'static> TaskSim<M> {
                     TaskEvent::Wake(task_id) => {
                         let mut state = self.state.borrow_mut();
                         state.ready_tasks.push(task_id);
+                    }
+                    TaskEvent::ApplyFailure(action) => {
+                        self.state.borrow_mut().apply_failure(action);
                     }
                     TaskEvent::Deliver {
                         src,
@@ -1976,6 +2068,60 @@ mod tests {
                     ctx.fail_link(NodeId(0), NodeId(1)); // 0->2 still routes via direct edge
                 }
             });
+        let stats = sim.run();
+        assert_eq!(stats.messages_delivered, 1);
+        assert_eq!(stats.messages_dropped, 0);
+    }
+
+    #[test]
+    fn scheduled_failure_applies_at_its_time() {
+        // Two FailLink actions scheduled at t=10ms cut node 0 off. Node 0
+        // sleeps past that, then sends — the send must find no route and drop.
+        let topology = TopologyBuilder::new(3)
+            .link(0u32, 1u32, Duration::from_millis(5))
+            .link(1u32, 2u32, Duration::from_millis(5))
+            .link(0u32, 2u32, Duration::from_millis(50))
+            .build();
+        let mut sim = TaskSimBuilder::<u64>::new(topology, 1).build(|ctx| async move {
+            if ctx.id() == NodeId(0) {
+                ctx.sleep(Duration::from_millis(20)).await;
+                ctx.send(NodeId(2), 1).await;
+            }
+        });
+        sim.schedule_failure(
+            Time::from_millis(10),
+            FailureAction::FailLink(NodeId(0), NodeId(1)),
+        );
+        sim.schedule_failure(
+            Time::from_millis(10),
+            FailureAction::FailLink(NodeId(0), NodeId(2)),
+        );
+        let stats = sim.run();
+        assert_eq!(stats.messages_delivered, 0);
+        assert_eq!(stats.messages_dropped, 1);
+    }
+
+    #[test]
+    fn scheduled_failure_heal_restores_route() {
+        // Fail at t=10, heal at t=40. A send at t=50 must route again.
+        let topology = TopologyBuilder::new(3)
+            .link(0u32, 1u32, Duration::from_millis(5))
+            .link(1u32, 2u32, Duration::from_millis(5))
+            .build();
+        let mut sim = TaskSimBuilder::<u64>::new(topology, 1).build(|ctx| async move {
+            if ctx.id() == NodeId(0) {
+                ctx.sleep(Duration::from_millis(50)).await;
+                ctx.send(NodeId(2), 1).await;
+            }
+        });
+        sim.schedule_failure(
+            Time::from_millis(10),
+            FailureAction::FailLink(NodeId(0), NodeId(1)),
+        );
+        sim.schedule_failure(
+            Time::from_millis(40),
+            FailureAction::HealLink(NodeId(0), NodeId(1)),
+        );
         let stats = sim.run();
         assert_eq!(stats.messages_delivered, 1);
         assert_eq!(stats.messages_dropped, 0);

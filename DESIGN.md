@@ -440,12 +440,13 @@ Concrete next moves, ordered by rough effort, smallest first.
    task-layer scenario (`task_scenario_*`) that is byte-equal across runs.
    The drop reasons are only `NoRoute` / `Partitioned` — the task layer has no
    packet loss or per-link buffers (that arrives with the congestion bridge).
-3. **Time-bounded failure scheduler helper.** A common pattern is
-   "fail at T1, heal at T2." Today users implement it inline by
-   checking `ctx.now()` on each handler tick (see
-   `examples/failure_injection.rs`). A small helper —
-   `Scenario::fail_at(time, action)` or similar — would dedupe that
-   pattern.
+3. **Time-bounded failure scheduler helper.** _Landed 2026-06-10._
+   `Scenario::fail_at(time, FailureAction)` (and the lower-level
+   `TaskSim::schedule_failure`) replace the hand-rolled "check `ctx.now()`
+   each tick" pattern. Failures are first-class scheduled events: a new
+   `TaskEvent::ApplyFailure(FailureAction)` variant is applied by the run loop
+   at its time and composes with `drop_in_flight_on_failure`. `FailureAction`
+   covers partition/link/node fail + heal variants.
 4. **In-flight drop in the async task layer.** _Landed 2026-06-10._
    `TaskSimBuilder::drop_in_flight_on_failure()` mirrors
    `NetConfig::drop_in_flight_on_failure`: the failure mutators (on both

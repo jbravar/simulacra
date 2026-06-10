@@ -31,6 +31,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   probe in Dijkstra, `partitions` probe at send time) carry real cost and a
   regression on them becomes visible — the existing empty-failure-set benches
   could not show this. Baseline numbers in `docs/perf-baseline.md`.
+- **Scheduled failures.** `Scenario::fail_at(time, FailureAction)` and the
+  lower-level `TaskSim::schedule_failure` apply a topology/partition mutation at
+  a fixed simulated time, replacing the hand-rolled "poll `ctx.now()` each tick"
+  pattern. `FailureAction` covers partition / link / node fail and heal
+  variants; failures are first-class scheduled events and compose with
+  `drop_in_flight_on_failure`.
 
 ### Changed
 
