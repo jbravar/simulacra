@@ -379,6 +379,62 @@ fn task_scenario_includes_delivery_and_noroute_drop() {
     );
 }
 
+/// Task-layer in-flight-drop scenario. Node 0 fires four 0->2 messages (each
+/// ~100ms in flight), then partitions the pair at t=20ms before any deliver.
+/// With `drop_in_flight_on_failure`, the sweep rewrites all four pending
+/// `Deliver` events into `Partitioned` drops — exercising the task-layer
+/// `EventQueue` rewrite path under tracing.
+fn run_task_drop_in_flight_scenario(seed: u64) -> String {
+    let topology = TopologyBuilder::new(3)
+        .link(0u32, 1u32, Duration::from_millis(50))
+        .link(1u32, 2u32, Duration::from_millis(50))
+        .build();
+
+    let sim = TaskSimBuilder::<u64>::new(topology, seed)
+        .with_trace()
+        .drop_in_flight_on_failure()
+        .build(|ctx| async move {
+            if ctx.id() == NodeId(0) {
+                for i in 0..4u64 {
+                    ctx.send(NodeId(2), i).await;
+                }
+                ctx.sleep(Duration::from_millis(20)).await;
+                ctx.partition(NodeId(0), NodeId(2));
+            }
+        });
+
+    let (_stats, trace) = sim.run_traced();
+    trace
+        .to_json()
+        .expect("task drop-in-flight trace should serialize to JSON cleanly")
+}
+
+#[test]
+fn task_drop_in_flight_is_byte_equal_across_runs() {
+    let a = run_task_drop_in_flight_scenario(0x1234);
+    let b = run_task_drop_in_flight_scenario(0x1234);
+    assert_eq!(
+        a, b,
+        "two task-sim drop-in-flight runs with the same seed produced \
+         different JSON traces; the rewrite path is non-deterministic"
+    );
+}
+
+#[test]
+fn task_drop_in_flight_drops_all_pending() {
+    let trace = run_task_drop_in_flight_scenario(0x1234);
+    assert_eq!(
+        trace.matches("\"Partitioned\"").count(),
+        4,
+        "expected all four in-flight messages swept into Partitioned drops"
+    );
+    assert_eq!(
+        trace.matches("\"Delivered\"").count(),
+        0,
+        "no message should have been delivered after the partition"
+    );
+}
+
 /// Coarse shape check on the emitted trace.
 ///
 /// If the trace format, seed serialization, or number of events changes,

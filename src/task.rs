@@ -164,11 +164,84 @@ struct SimState<M> {
     /// in the engine, so recording cannot affect scheduling, RNG, or event
     /// ordering, and therefore cannot affect determinism.
     trace: Option<TraceRecorder<TaskTraceEvent>>,
+    /// When `true`, a failure mutator (`partition` / `fail_link` /
+    /// `fail_link_directed` / `fail_node`) sweeps the pending event queue and
+    /// drops any in-flight `Deliver` whose `(src, dst)` no longer routes,
+    /// recording it at the time of the failure. Mirrors
+    /// [`crate::net::NetConfig::drop_in_flight_on_failure`]. Defaults to
+    /// `false` (in-flight messages survive a mid-run failure).
+    drop_in_flight_on_failure: bool,
+}
+
+/// Sweeps `events`, removing every in-flight `Deliver` whose `(src, dst)` no
+/// longer routes under the current topology/partition state and returning the
+/// dropped pairs (with reason) so the caller can record them. Surviving
+/// `Deliver` and `Wake` events are kept at their original time (with fresh
+/// sequence numbers, per [`EventQueue::rewrite`]). A free function so it can
+/// borrow `events` and `topology` disjointly from the rest of `SimState`.
+fn sweep_in_flight_drops<M>(
+    events: &mut EventQueue<TaskEvent<M>>,
+    topology: &mut Topology,
+    partitions: &HashSet<(NodeId, NodeId)>,
+) -> Vec<(NodeId, NodeId, TaskTraceDropReason)> {
+    let mut dropped = Vec::new();
+    events.rewrite(|scheduled| match scheduled.event {
+        TaskEvent::Deliver {
+            src,
+            dst,
+            payload,
+            sent_at,
+        } => {
+            if partitions.contains(&pair_key(src, dst)) {
+                dropped.push((src, dst, TaskTraceDropReason::Partitioned));
+                None
+            } else if topology.route(src, dst).is_none() {
+                dropped.push((src, dst, TaskTraceDropReason::NoRoute));
+                None
+            } else {
+                Some((
+                    scheduled.time,
+                    TaskEvent::Deliver {
+                        src,
+                        dst,
+                        payload,
+                        sent_at,
+                    },
+                ))
+            }
+        }
+        wake @ TaskEvent::Wake(_) => Some((scheduled.time, wake)),
+    });
+    // Canonicalize the recorded-drop order by node pair so the trace does not
+    // depend on the heap's internal drain order.
+    dropped.sort_unstable_by_key(|&(src, dst, _)| (src.as_u32(), dst.as_u32()));
+    dropped
 }
 
 impl<M> SimState<M> {
     fn schedule_wake(&mut self, time: Time, task_id: TaskId) {
         self.events.schedule(time, TaskEvent::Wake(task_id));
+    }
+
+    /// If in-flight drop is enabled, sweep the event queue for `Deliver`
+    /// events whose route no longer exists and turn them into recorded drops
+    /// at the current time. Called from the failure mutators.
+    fn maybe_sweep_in_flight(&mut self) {
+        if !self.drop_in_flight_on_failure {
+            return;
+        }
+        let dropped = sweep_in_flight_drops(&mut self.events, &mut self.topology, &self.partitions);
+        for (src, dst, reason) in dropped {
+            #[expect(
+                clippy::arithmetic_side_effects,
+                reason = "monotonic u64 dropped-message counter; 2^64 drops is \
+                          physically unreachable in a simulation run"
+            )]
+            {
+                self.messages_dropped += 1;
+            }
+            self.record_drop(src, dst, reason);
+        }
     }
 
     /// Records a delivery into the optional trace recorder, at the current
@@ -268,9 +341,12 @@ impl<M: 'static> NodeContext<M> {
     /// Installs a symmetric partition between `a` and `b`. Subsequent
     /// `send` calls across this pair (in either direction) will be dropped
     /// silently, with the run's `messages_dropped` counter incremented.
-    /// In-flight messages already scheduled for delivery are not affected.
+    /// In-flight messages already scheduled for delivery survive unless the
+    /// sim was built with [`TaskSimBuilder::drop_in_flight_on_failure`].
     pub fn partition(&self, a: NodeId, b: NodeId) {
-        self.state.borrow_mut().partitions.insert(pair_key(a, b));
+        let mut state = self.state.borrow_mut();
+        state.partitions.insert(pair_key(a, b));
+        state.maybe_sweep_in_flight();
     }
 
     /// Removes a previously-installed partition between `a` and `b`.
@@ -286,10 +362,14 @@ impl<M: 'static> NodeContext<M> {
 
     /// Fails the bidirectional link between `a` and `b` at the topology
     /// level. Sends whose route required this link will reroute (if an
-    /// alternative exists) or drop. In-flight messages already scheduled
-    /// for delivery are not affected.
+    /// alternative exists) or drop. In-flight messages already scheduled for
+    /// delivery survive unless the sim was built with
+    /// [`TaskSimBuilder::drop_in_flight_on_failure`] (in which case any whose
+    /// route no longer exists are dropped).
     pub fn fail_link(&self, a: NodeId, b: NodeId) {
-        self.state.borrow_mut().topology.fail_link(a, b);
+        let mut state = self.state.borrow_mut();
+        state.topology.fail_link(a, b);
+        state.maybe_sweep_in_flight();
     }
 
     /// Restores a previously-failed bidirectional link between `a` and `b`.
@@ -304,12 +384,12 @@ impl<M: 'static> NodeContext<M> {
         self.state.borrow().topology.is_link_failed(a, b)
     }
 
-    /// Fails a single direction of the link between `src` and `dst`.
+    /// Fails a single direction of the link between `src` and `dst`. Honors
+    /// [`TaskSimBuilder::drop_in_flight_on_failure`] for in-flight messages.
     pub fn fail_link_directed(&self, src: NodeId, dst: NodeId) {
-        self.state
-            .borrow_mut()
-            .topology
-            .fail_link_directed(src, dst);
+        let mut state = self.state.borrow_mut();
+        state.topology.fail_link_directed(src, dst);
+        state.maybe_sweep_in_flight();
     }
 
     /// Restores a single direction of the link between `src` and `dst`.
@@ -330,8 +410,12 @@ impl<M: 'static> NodeContext<M> {
     }
 
     /// Marks `node` as failed; routing excludes it as src, dst, or hop.
+    /// Honors [`TaskSimBuilder::drop_in_flight_on_failure`] for in-flight
+    /// messages.
     pub fn fail_node(&self, node: NodeId) {
-        self.state.borrow_mut().topology.fail_node(node);
+        let mut state = self.state.borrow_mut();
+        state.topology.fail_node(node);
+        state.maybe_sweep_in_flight();
     }
 
     /// Restores a previously-failed node.
@@ -686,6 +770,7 @@ pub struct TaskSimBuilder<M: 'static> {
     topology: Topology,
     seed: u64,
     trace_enabled: bool,
+    drop_in_flight_on_failure: bool,
     _phantom: std::marker::PhantomData<M>,
 }
 
@@ -697,8 +782,26 @@ impl<M: 'static> TaskSimBuilder<M> {
             topology,
             seed,
             trace_enabled: false,
+            drop_in_flight_on_failure: false,
             _phantom: std::marker::PhantomData,
         }
+    }
+
+    /// Drops in-flight messages when a failure strands them.
+    ///
+    /// By default, a mid-run `partition` / `fail_link` / `fail_node` only
+    /// affects *future* sends; messages already scheduled for delivery still
+    /// arrive. With this set, those failure mutators also sweep the pending
+    /// event queue and drop any in-flight message whose `(src, dst)` no longer
+    /// routes, counting it in `messages_dropped` (and recording a `Dropped`
+    /// trace event when tracing is enabled) at the time of the failure.
+    ///
+    /// Mirrors [`crate::net::NetConfig::drop_in_flight_on_failure`] for the
+    /// async task layer.
+    #[must_use]
+    pub const fn drop_in_flight_on_failure(mut self) -> Self {
+        self.drop_in_flight_on_failure = true;
+        self
     }
 
     /// Enables trace recording for the built simulation.
@@ -758,6 +861,7 @@ impl<M: 'static> TaskSimBuilder<M> {
             } else {
                 None
             },
+            drop_in_flight_on_failure: self.drop_in_flight_on_failure,
         }));
 
         // Create tasks for each node
@@ -901,7 +1005,9 @@ impl<M: Clone + 'static> TaskSim<M> {
     /// Installs a symmetric partition between `a` and `b`. See
     /// [`NodeContext::partition`].
     pub fn partition(&mut self, a: NodeId, b: NodeId) {
-        self.state.borrow_mut().partitions.insert(pair_key(a, b));
+        let mut state = self.state.borrow_mut();
+        state.partitions.insert(pair_key(a, b));
+        state.maybe_sweep_in_flight();
     }
 
     /// Removes a previously-installed partition.
@@ -915,9 +1021,12 @@ impl<M: Clone + 'static> TaskSim<M> {
         self.state.borrow().partitions.contains(&pair_key(a, b))
     }
 
-    /// Fails the bidirectional link between `a` and `b`.
+    /// Fails the bidirectional link between `a` and `b`. See
+    /// [`NodeContext::fail_link`].
     pub fn fail_link(&mut self, a: NodeId, b: NodeId) {
-        self.state.borrow_mut().topology.fail_link(a, b);
+        let mut state = self.state.borrow_mut();
+        state.topology.fail_link(a, b);
+        state.maybe_sweep_in_flight();
     }
 
     /// Restores a previously-failed bidirectional link.
@@ -932,12 +1041,12 @@ impl<M: Clone + 'static> TaskSim<M> {
         self.state.borrow().topology.is_link_failed(a, b)
     }
 
-    /// Fails a single direction of the link between `src` and `dst`.
+    /// Fails a single direction of the link between `src` and `dst`. See
+    /// [`NodeContext::fail_link_directed`].
     pub fn fail_link_directed(&mut self, src: NodeId, dst: NodeId) {
-        self.state
-            .borrow_mut()
-            .topology
-            .fail_link_directed(src, dst);
+        let mut state = self.state.borrow_mut();
+        state.topology.fail_link_directed(src, dst);
+        state.maybe_sweep_in_flight();
     }
 
     /// Restores a single direction of the link between `src` and `dst`.
@@ -957,9 +1066,11 @@ impl<M: Clone + 'static> TaskSim<M> {
             .is_link_failed_directed(src, dst)
     }
 
-    /// Marks `node` as failed.
+    /// Marks `node` as failed. See [`NodeContext::fail_node`].
     pub fn fail_node(&mut self, node: NodeId) {
-        self.state.borrow_mut().topology.fail_node(node);
+        let mut state = self.state.borrow_mut();
+        state.topology.fail_node(node);
+        state.maybe_sweep_in_flight();
     }
 
     /// Restores a previously-failed node.
@@ -1781,6 +1892,93 @@ mod tests {
         assert_eq!(untraced.task_polls, traced.task_polls);
         assert_eq!(untraced.tasks_completed, traced.tasks_completed);
         assert_eq!(untraced.final_time, traced.final_time);
+    }
+
+    #[test]
+    fn drop_in_flight_off_preserves_pending_delivery() {
+        // Default: a mid-run partition does not touch an already-scheduled
+        // delivery; the message still arrives.
+        let topology = TopologyBuilder::new(3)
+            .link(0u32, 1u32, Duration::from_millis(50))
+            .link(1u32, 2u32, Duration::from_millis(50))
+            .build();
+        let sim = TaskSimBuilder::<u64>::new(topology, 1).build(|ctx| async move {
+            if ctx.id() == NodeId(0) {
+                ctx.send(NodeId(2), 7).await; // delivery scheduled at ~100ms
+                ctx.sleep(Duration::from_millis(20)).await;
+                ctx.partition(NodeId(0), NodeId(2)); // flag off: no sweep
+            }
+        });
+        let stats = sim.run();
+        assert_eq!(stats.messages_delivered, 1);
+        assert_eq!(stats.messages_dropped, 0);
+    }
+
+    #[test]
+    fn drop_in_flight_partition_drops_pending_delivery() {
+        let topology = TopologyBuilder::new(3)
+            .link(0u32, 1u32, Duration::from_millis(50))
+            .link(1u32, 2u32, Duration::from_millis(50))
+            .build();
+        let sim = TaskSimBuilder::<u64>::new(topology, 1)
+            .drop_in_flight_on_failure()
+            .build(|ctx| async move {
+                if ctx.id() == NodeId(0) {
+                    ctx.send(NodeId(2), 7).await;
+                    ctx.sleep(Duration::from_millis(20)).await;
+                    ctx.partition(NodeId(0), NodeId(2)); // sweeps the in-flight deliver
+                }
+            });
+        let stats = sim.run();
+        assert_eq!(stats.messages_delivered, 0);
+        assert_eq!(stats.messages_dropped, 1);
+    }
+
+    #[test]
+    fn drop_in_flight_link_failure_drops_when_no_alternate() {
+        // Line topology: failing 0-1 leaves no route 0->2, so the in-flight
+        // message is dropped.
+        let topology = TopologyBuilder::new(3)
+            .link(0u32, 1u32, Duration::from_millis(50))
+            .link(1u32, 2u32, Duration::from_millis(50))
+            .build();
+        let sim = TaskSimBuilder::<u64>::new(topology, 1)
+            .drop_in_flight_on_failure()
+            .build(|ctx| async move {
+                if ctx.id() == NodeId(0) {
+                    ctx.send(NodeId(2), 7).await;
+                    ctx.sleep(Duration::from_millis(20)).await;
+                    ctx.fail_link(NodeId(0), NodeId(1));
+                }
+            });
+        let stats = sim.run();
+        assert_eq!(stats.messages_delivered, 0);
+        assert_eq!(stats.messages_dropped, 1);
+    }
+
+    #[test]
+    fn drop_in_flight_preserves_when_alternate_route_exists() {
+        // Triangle: failing 0-1 still leaves the direct 0-2 edge, so an
+        // in-flight message survives (at its original delivery time — the
+        // sweep drops only messages with no remaining route, it does not
+        // reroute).
+        let topology = TopologyBuilder::new(3)
+            .link(0u32, 1u32, Duration::from_millis(5))
+            .link(1u32, 2u32, Duration::from_millis(5))
+            .link(0u32, 2u32, Duration::from_millis(50))
+            .build();
+        let sim = TaskSimBuilder::<u64>::new(topology, 1)
+            .drop_in_flight_on_failure()
+            .build(|ctx| async move {
+                if ctx.id() == NodeId(0) {
+                    ctx.send(NodeId(2), 7).await; // via fast 0-1-2 (10ms)
+                    ctx.sleep(Duration::from_millis(2)).await;
+                    ctx.fail_link(NodeId(0), NodeId(1)); // 0->2 still routes via direct edge
+                }
+            });
+        let stats = sim.run();
+        assert_eq!(stats.messages_delivered, 1);
+        assert_eq!(stats.messages_dropped, 0);
     }
 
     #[cfg(feature = "serde")]

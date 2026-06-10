@@ -19,6 +19,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   observer with no effect on scheduling, RNG, or event ordering. The
   `tests/determinism.rs` guardrail gained a task-layer scenario that is
   byte-identical across runs.
+- **In-flight drop for the async task layer.**
+  `TaskSimBuilder::drop_in_flight_on_failure()` makes a mid-run `partition` /
+  `fail_link` / `fail_node` (on either `NodeContext` or `TaskSim`) sweep the
+  pending event queue and drop any in-flight message whose route no longer
+  exists, recording it at the failure time. Mirrors
+  `NetConfig::drop_in_flight_on_failure`; off by default (in-flight messages
+  survive).
 
 ### Changed
 

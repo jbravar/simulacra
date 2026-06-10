@@ -447,11 +447,15 @@ Concrete next moves, ordered by rough effort, smallest first.
    `examples/failure_injection.rs`). A small helper —
    `Scenario::fail_at(time, action)` or similar — would dedupe that
    pattern.
-4. **In-flight drop in the async task layer.** `Network` has the opt-in
-   `NetConfig::drop_in_flight_on_failure`; `TaskSim` does not. Symmetry
-   would mean adding the same flag to `TaskSimBuilder` / `TaskSim` and
-   sweeping `events: EventQueue<TaskEvent<M>>` on failure mutators.
-   Mostly mechanical given the existing `EventQueue::rewrite` primitive.
+4. **In-flight drop in the async task layer.** _Landed 2026-06-10._
+   `TaskSimBuilder::drop_in_flight_on_failure()` mirrors
+   `NetConfig::drop_in_flight_on_failure`: the failure mutators (on both
+   `NodeContext` and `TaskSim`) sweep `events: EventQueue<TaskEvent<M>>` via
+   `EventQueue::rewrite` and drop any pending `Deliver` whose `(src, dst)` no
+   longer routes. The task layer removes the event and records the drop
+   synchronously (it has no in-queue `Drop` event), and the sweep is eager
+   (task mutations are always synchronous — no deferred-flag step like
+   `Network::run`).
 5. **Queueing disciplines beyond FIFO.** Per-link bandwidth + buffer +
    tail/RED drop is in. Missing: priority queues, weighted fair
    queueing (WFQ), traffic classes. Each is its own design exercise;
