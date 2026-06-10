@@ -18,6 +18,12 @@
 //! ```sh
 //! cargo run --example failure_injection
 //! ```
+// Illustrative example, not load-bearing library code.
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "example code: scenario-bounded arithmetic, not load-bearing"
+)]
+
 use simulacra::{Duration, NodeContext, NodeId, TaskSimBuilder, Time, TopologyBuilder};
 
 const CLIENT: NodeId = NodeId(0);

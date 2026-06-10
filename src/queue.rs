@@ -3,6 +3,13 @@
 //! Events are ordered by time, with ties broken by insertion order (sequence number).
 //! This ensures completely deterministic simulation behavior.
 
+// See `sim.rs` for the rationale: kernel arithmetic panics on overflow by the
+// documented determinism contract; `saturating_*` is the opt-in.
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "documented panic-on-overflow determinism contract; see DESIGN.md"
+)]
+
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
@@ -24,8 +31,8 @@ pub struct Scheduled<E> {
 
 impl<E> Scheduled<E> {
     /// Creates a new scheduled event.
-    pub fn new(time: Time, sequence: u64, event: E) -> Self {
-        Scheduled {
+    pub const fn new(time: Time, sequence: u64, event: E) -> Self {
+        Self {
             time,
             sequence,
             event,
@@ -70,16 +77,18 @@ pub struct EventQueue<E> {
 
 impl<E> EventQueue<E> {
     /// Creates a new empty event queue.
-    pub fn new() -> Self {
-        EventQueue {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
             heap: BinaryHeap::new(),
             next_sequence: 0,
         }
     }
 
     /// Creates a new event queue with the specified capacity.
+    #[must_use]
     pub fn with_capacity(capacity: usize) -> Self {
-        EventQueue {
+        Self {
             heap: BinaryHeap::with_capacity(capacity),
             next_sequence: 0,
         }
@@ -101,16 +110,19 @@ impl<E> EventQueue<E> {
     }
 
     /// Returns a reference to the next event without removing it.
+    #[must_use]
     pub fn peek(&self) -> Option<&Scheduled<E>> {
         self.heap.peek()
     }
 
     /// Returns `true` if the queue is empty.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.heap.is_empty()
     }
 
     /// Returns the number of scheduled events.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.heap.len()
     }
@@ -123,7 +135,8 @@ impl<E> EventQueue<E> {
     /// Returns the total number of events that have been scheduled.
     ///
     /// This is useful for statistics and debugging.
-    pub fn total_scheduled(&self) -> u64 {
+    #[must_use]
+    pub const fn total_scheduled(&self) -> u64 {
         self.next_sequence
     }
 

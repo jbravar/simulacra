@@ -7,7 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-_Nothing yet._
+### Changed
+
+- Hardened the clippy lint policy: enabled the `pedantic` and `nursery` groups
+  plus a cherry-picked set of `restriction` lints (no-panic / no-unwrap,
+  no-silent-failure, numeric-cast, and unsafe-hygiene). Suppressions must now be
+  a scoped `#[expect(..., reason = "…")]` rather than a bare `#[allow]`
+  (enforced by `allow_attributes_without_reason`). The kernel's integer-time
+  **panic-on-overflow determinism contract is preserved**: arithmetic that must
+  panic still does (via `checked_*().expect(...)` or a documented module-level
+  `#[expect(clippy::arithmetic_side_effects)]`), and no operator, cast, or RNG
+  draw was semantically altered — traces remain byte-identical.
+- Marked ~30 public accessors and constructors `const fn` and added
+  `#[must_use]` to constructors, accessors, builder-by-value methods, and the
+  task futures. These are forward-compatible additions to the public API with
+  no behavioral change.
+
+### Documentation
+
+- Added `# Panics` / `# Errors` rustdoc sections documenting pre-existing
+  panic and error behavior on `SimRng::choice`, the RED drop policy, and the
+  `serde` trace (de)serialization methods.
 
 ## [0.1.0] - 2026-05-15
 

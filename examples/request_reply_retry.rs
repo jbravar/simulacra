@@ -13,6 +13,12 @@
 //! cargo run --example request_reply_retry
 //! ```
 
+// Illustrative example, not load-bearing library code.
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "example code: scenario-bounded arithmetic, not load-bearing"
+)]
+
 use simulacra::{Duration, NodeContext, NodeId, TaskSimBuilder, TopologyBuilder};
 
 /// Message format: request carries a per-attempt sequence number; reply echoes it.

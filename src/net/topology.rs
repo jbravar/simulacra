@@ -116,8 +116,9 @@ impl Topology {
     /// first successful `route()` call. This keeps construction and
     /// mutation (`add_link`, `add_bidi_link`) O(1) with respect to
     /// `node_count` even though the cache itself is O(N²).
+    #[must_use]
     pub fn new(node_count: usize) -> Self {
-        Topology {
+        Self {
             node_count,
             adjacency: vec![Vec::new(); node_count],
             routes: None,
@@ -130,18 +131,30 @@ impl Topology {
     }
 
     #[inline]
-    fn route_idx(&self, src: NodeId, dst: NodeId) -> usize {
+    #[expect(
+        clippy::arithmetic_side_effects,
+        reason = "src/dst are node ids < node_count, so src*node_count + dst < \
+                  node_count^2; overflow needs node_count > sqrt(usize::MAX) (~4e9), \
+                  unreachable for an in-memory adjacency graph"
+    )]
+    const fn route_idx(&self, src: NodeId, dst: NodeId) -> usize {
         src.as_usize() * self.node_count + dst.as_usize()
     }
 
     /// Returns the number of nodes in the topology.
     #[inline]
-    pub fn node_count(&self) -> usize {
+    #[must_use]
+    pub const fn node_count(&self) -> usize {
         self.node_count
     }
 
     /// Returns an iterator over all node IDs.
     pub fn nodes(&self) -> impl Iterator<Item = NodeId> {
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "NodeId is a 32-bit identifier by definition; node_count never \
+                      approaches 2^32, so the index always fits in u32"
+        )]
         (0..self.node_count).map(|i| NodeId::new(i as u32))
     }
 
@@ -199,6 +212,11 @@ impl Topology {
     ) {
         self.clear_route_cache();
         if src.as_usize() < self.node_count && dst.as_usize() < self.node_count {
+            #[expect(
+                clippy::indexing_slicing,
+                reason = "guarded by `src.as_usize() < self.node_count` just above, \
+                          and adjacency has exactly node_count entries"
+            )]
             self.adjacency[src.as_usize()].push(Link {
                 target: dst,
                 latency,
@@ -222,6 +240,7 @@ impl Topology {
     /// Used by the network layer to look up per-hop properties (latency,
     /// bandwidth) while walking a route. If the graph has parallel edges,
     /// this returns the one that was inserted first.
+    #[must_use]
     pub fn link_between(&self, src: NodeId, dst: NodeId) -> Option<&Link> {
         self.adjacency
             .get(src.as_usize())?
@@ -230,11 +249,11 @@ impl Topology {
     }
 
     /// Returns the outgoing links from a node.
+    #[must_use]
     pub fn links_from(&self, node: NodeId) -> &[Link] {
         self.adjacency
             .get(node.as_usize())
-            .map(|v| v.as_slice())
-            .unwrap_or(&[])
+            .map_or(&[], std::vec::Vec::as_slice)
     }
 
     /// Computes and returns the shortest-path route from `src` to `dst`.
@@ -254,6 +273,14 @@ impl Topology {
 
         let idx = self.route_idx(src, dst);
 
+        // `idx == src*node_count + dst` with src,dst < node_count, and the
+        // cache is always `vec![None; node_count*node_count]` (node_count is
+        // fixed at construction), so `idx < cache.len()` always holds.
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "idx = src*node_count + dst with src,dst < node_count and cache \
+                      length == node_count^2, so idx is always in bounds"
+        )]
         // Fast path: cache populated and hit.
         if let Some(cache) = self.routes.as_ref()
             && let Some(route) = cache[idx]
@@ -264,8 +291,21 @@ impl Topology {
         // Slow path: compute and (lazily) allocate the cache.
         let route = self.compute_route(src, dst)?;
         let n = self.node_count;
-        let cache = self.routes.get_or_insert_with(|| vec![None; n * n]);
-        cache[idx] = Some(route);
+        #[expect(
+            clippy::arithmetic_side_effects,
+            reason = "n == node_count; n*n overflows only for node_count > \
+                      sqrt(usize::MAX) (~4e9), unreachable for an in-memory graph"
+        )]
+        let cache_len = n * n;
+        let cache = self.routes.get_or_insert_with(|| vec![None; cache_len]);
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "idx = src*node_count + dst with src,dst < node_count and cache \
+                      length == node_count^2, so idx is always in bounds"
+        )]
+        {
+            cache[idx] = Some(route);
+        }
         Some(route)
     }
 
@@ -287,38 +327,50 @@ impl Topology {
         self.prev_scratch.resize(n, None);
         self.heap_scratch.clear();
 
-        self.dist_scratch[src.as_usize()] = 0;
-        self.heap_scratch.push(DijkstraState { cost: 0, node: src });
+        // All node ids indexed below (`src`, `dst`, `node`, `link.target`)
+        // are valid topology nodes, i.e. `< node_count == n`, which is the
+        // length the scratch buffers and adjacency are sized to. This is the
+        // standing caller invariant; out-of-range ids would panic here, which
+        // is the existing (unchanged) behavior.
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "every index is a node id < node_count, and dist_scratch / \
+                      prev_scratch / adjacency all have length node_count"
+        )]
+        {
+            self.dist_scratch[src.as_usize()] = 0;
+            self.heap_scratch.push(DijkstraState { cost: 0, node: src });
 
-        while let Some(DijkstraState { cost, node }) = self.heap_scratch.pop() {
-            if node == dst {
-                break;
-            }
+            while let Some(DijkstraState { cost, node }) = self.heap_scratch.pop() {
+                if node == dst {
+                    break;
+                }
 
-            if cost > self.dist_scratch[node.as_usize()] {
-                continue;
-            }
-
-            for link in &self.adjacency[node.as_usize()] {
-                if self.failed_links.contains(&(node, link.target))
-                    || self.failed_nodes.contains(&link.target)
-                {
+                if cost > self.dist_scratch[node.as_usize()] {
                     continue;
                 }
-                let next_cost = cost.saturating_add(link.latency.as_nanos());
-                if next_cost < self.dist_scratch[link.target.as_usize()] {
-                    self.dist_scratch[link.target.as_usize()] = next_cost;
-                    self.prev_scratch[link.target.as_usize()] = Some(node);
-                    self.heap_scratch.push(DijkstraState {
-                        cost: next_cost,
-                        node: link.target,
-                    });
+
+                for link in &self.adjacency[node.as_usize()] {
+                    if self.failed_links.contains(&(node, link.target))
+                        || self.failed_nodes.contains(&link.target)
+                    {
+                        continue;
+                    }
+                    let next_cost = cost.saturating_add(link.latency.as_nanos());
+                    if next_cost < self.dist_scratch[link.target.as_usize()] {
+                        self.dist_scratch[link.target.as_usize()] = next_cost;
+                        self.prev_scratch[link.target.as_usize()] = Some(node);
+                        self.heap_scratch.push(DijkstraState {
+                            cost: next_cost,
+                            node: link.target,
+                        });
+                    }
                 }
             }
-        }
 
-        // No path found
-        self.prev_scratch[dst.as_usize()]?;
+            // No path found
+            self.prev_scratch[dst.as_usize()]?;
+        }
 
         // Reconstruct path to find next_hop and hop_count. Path length is
         // bounded by the diameter of the graph (typically small), so we
@@ -326,6 +378,10 @@ impl Topology {
         let mut path = Vec::with_capacity(8);
         path.push(dst);
         let mut current = dst;
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "`current` is a node id < node_count == prev_scratch.len()"
+        )]
         while let Some(p) = self.prev_scratch[current.as_usize()] {
             path.push(p);
             current = p;
@@ -339,9 +395,30 @@ impl Topology {
         }
 
         path.reverse();
+        // `route()` returns early for src == dst, so reaching here means the
+        // loop walked at least one predecessor: path == [src, ..., dst] with
+        // len >= 2, so `path[1]` exists and `path.len() - 1 >= 1`.
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "path is [src, ..., dst] with len >= 2 (src != dst guaranteed by \
+                      route()), so index 1 is in bounds"
+        )]
         let next_hop = path[1]; // First node after src
+        #[expect(
+            clippy::arithmetic_side_effects,
+            reason = "path.len() >= 2 here, so the subtraction cannot underflow"
+        )]
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "hop_count is bounded by the graph diameter < node_count, which \
+                      never approaches 2^32"
+        )]
         let hop_count = (path.len() - 1) as u32;
 
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "dst is a node id < node_count == dist_scratch.len()"
+        )]
         Some(Route {
             next_hop,
             total_latency: Duration::from_nanos(self.dist_scratch[dst.as_usize()]),
@@ -378,6 +455,7 @@ impl Topology {
 
     /// Returns `true` if the directed edge `src -> dst` is currently marked
     /// as failed.
+    #[must_use]
     pub fn is_link_failed_directed(&self, src: NodeId, dst: NodeId) -> bool {
         self.failed_links.contains(&(src, dst))
     }
@@ -401,6 +479,7 @@ impl Topology {
     /// Returns `true` if both directions of the link between `a` and `b`
     /// are currently failed. For an asymmetric check, use
     /// [`Topology::is_link_failed_directed`].
+    #[must_use]
     pub fn is_link_failed(&self, a: NodeId, b: NodeId) -> bool {
         self.is_link_failed_directed(a, b) && self.is_link_failed_directed(b, a)
     }
@@ -427,6 +506,7 @@ impl Topology {
     }
 
     /// Returns `true` if `node` is currently marked as failed.
+    #[must_use]
     pub fn is_node_failed(&self, node: NodeId) -> bool {
         self.failed_nodes.contains(&node)
     }
@@ -438,7 +518,13 @@ impl Topology {
         for src in 0..self.node_count {
             for dst in 0..self.node_count {
                 if src != dst {
-                    let _ = self.route(NodeId::new(src as u32), NodeId::new(dst as u32));
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        reason = "NodeId is a 32-bit identifier by definition; \
+                                  node_count never approaches 2^32"
+                    )]
+                    let (src_id, dst_id) = (NodeId::new(src as u32), NodeId::new(dst as u32));
+                    self.route(src_id, dst_id);
                 }
             }
         }
@@ -461,19 +547,22 @@ pub struct TopologyBuilder {
 
 impl TopologyBuilder {
     /// Creates a new builder with the given number of nodes.
+    #[must_use]
     pub fn new(node_count: usize) -> Self {
-        TopologyBuilder {
+        Self {
             topology: Topology::new(node_count),
         }
     }
 
     /// Adds a bidirectional link.
+    #[must_use]
     pub fn link(mut self, a: impl Into<NodeId>, b: impl Into<NodeId>, latency: Duration) -> Self {
         self.topology.add_bidi_link(a.into(), b.into(), latency);
         self
     }
 
     /// Adds a directed link.
+    #[must_use]
     pub fn directed_link(
         mut self,
         src: impl Into<NodeId>,
@@ -489,6 +578,7 @@ impl TopologyBuilder {
     /// `lat_ab` is the latency from `a` to `b`; `lat_ba` is the latency from
     /// `b` to `a`. Useful for modeling asymmetric paths (e.g., different
     /// up/down bandwidth, satellite links).
+    #[must_use]
     pub fn link_asymmetric(
         mut self,
         a: impl Into<NodeId>,
@@ -508,6 +598,7 @@ impl TopologyBuilder {
     /// Per-link bandwidth is applied by [`Network::send_sized`](crate::net::Network::send_sized)
     /// and stacks independently per direction (each direction has its own
     /// serialization queue in the network runtime).
+    #[must_use]
     pub fn link_with_capacity(
         mut self,
         a: impl Into<NodeId>,
@@ -524,6 +615,7 @@ impl TopologyBuilder {
     }
 
     /// Adds a directed link with a bandwidth cap in bytes/sec.
+    #[must_use]
     pub fn directed_link_with_capacity(
         mut self,
         src: impl Into<NodeId>,
@@ -542,6 +634,7 @@ impl TopologyBuilder {
     /// Messages whose arrival would push the in-flight byte count over
     /// `buffer_bytes` are dropped with
     /// [`DropReason::BufferOverflow`](crate::net::DropReason::BufferOverflow).
+    #[must_use]
     pub fn link_with_capacity_and_buffer(
         mut self,
         a: impl Into<NodeId>,
@@ -560,6 +653,7 @@ impl TopologyBuilder {
     }
 
     /// Adds a directed link with a bandwidth cap and a per-link buffer.
+    #[must_use]
     pub fn directed_link_with_capacity_and_buffer(
         mut self,
         src: impl Into<NodeId>,
@@ -584,6 +678,7 @@ impl TopologyBuilder {
     /// Use [`DropPolicy::red`] to construct a validated RED configuration,
     /// or [`DropPolicy::TailDrop`] for the default FIFO behavior
     /// (equivalent to [`TopologyBuilder::link_with_capacity_and_buffer`]).
+    #[must_use]
     pub fn link_with_policy(
         mut self,
         a: impl Into<NodeId>,
@@ -615,6 +710,7 @@ impl TopologyBuilder {
     }
 
     /// Directed version of [`TopologyBuilder::link_with_policy`].
+    #[must_use]
     pub fn directed_link_with_policy(
         mut self,
         src: impl Into<NodeId>,
@@ -636,53 +732,99 @@ impl TopologyBuilder {
     }
 
     /// Creates a ring topology where each node connects to its neighbors.
+    #[must_use]
     pub fn ring(mut self, latency: Duration) -> Self {
         let n = self.topology.node_count;
         for i in 0..n {
+            #[expect(
+                clippy::arithmetic_side_effects,
+                reason = "i < n so i+1 <= n; overflow needs i == usize::MAX, \
+                          unreachable for a node index"
+            )]
             let next = (i + 1) % n;
-            self.topology
-                .add_bidi_link(NodeId::new(i as u32), NodeId::new(next as u32), latency);
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "NodeId is a 32-bit identifier; node_count never approaches \
+                          2^32"
+            )]
+            let (a, b) = (NodeId::new(i as u32), NodeId::new(next as u32));
+            self.topology.add_bidi_link(a, b, latency);
         }
         self
     }
 
     /// Creates a fully connected mesh where every node connects to every other node.
+    #[must_use]
     pub fn full_mesh(mut self, latency: Duration) -> Self {
         let n = self.topology.node_count;
         for i in 0..n {
-            for j in (i + 1)..n {
-                self.topology
-                    .add_bidi_link(NodeId::new(i as u32), NodeId::new(j as u32), latency);
+            #[expect(
+                clippy::arithmetic_side_effects,
+                reason = "i < n so i+1 <= n; overflow needs i == usize::MAX, \
+                          unreachable for a node index"
+            )]
+            let start = i + 1;
+            for j in start..n {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "NodeId is a 32-bit identifier; node_count never \
+                              approaches 2^32"
+                )]
+                let (a, b) = (NodeId::new(i as u32), NodeId::new(j as u32));
+                self.topology.add_bidi_link(a, b, latency);
             }
         }
         self
     }
 
     /// Creates a star topology with node 0 as the hub.
+    #[must_use]
     pub fn star(mut self, latency: Duration) -> Self {
         let n = self.topology.node_count;
         let hub = NodeId::new(0);
         for i in 1..n {
-            self.topology
-                .add_bidi_link(hub, NodeId::new(i as u32), latency);
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "NodeId is a 32-bit identifier; node_count never approaches \
+                          2^32"
+            )]
+            let spoke = NodeId::new(i as u32);
+            self.topology.add_bidi_link(hub, spoke, latency);
         }
         self
     }
 
     /// Creates a line topology (chain).
+    #[must_use]
     pub fn line(mut self, latency: Duration) -> Self {
         let n = self.topology.node_count;
-        for i in 0..(n - 1) {
-            self.topology.add_bidi_link(
-                NodeId::new(i as u32),
-                NodeId::new((i + 1) as u32),
-                latency,
-            );
+        #[expect(
+            clippy::arithmetic_side_effects,
+            reason = "n-1 underflows only for an empty (n == 0) topology; `line()` on \
+                      zero nodes already panics here today and is not an exercised \
+                      scenario, so the existing behavior is preserved. Latent: a \
+                      saturating fix would silently make n == 0 a no-op instead"
+        )]
+        let last = n - 1;
+        for i in 0..last {
+            #[expect(
+                clippy::arithmetic_side_effects,
+                reason = "i < n-1 so i+1 < n; overflow needs i == usize::MAX, \
+                          unreachable for a node index"
+            )]
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "NodeId is a 32-bit identifier; node_count never approaches \
+                          2^32"
+            )]
+            let (a, b) = (NodeId::new(i as u32), NodeId::new((i + 1) as u32));
+            self.topology.add_bidi_link(a, b, latency);
         }
         self
     }
 
     /// Builds the topology.
+    #[must_use]
     pub fn build(self) -> Topology {
         self.topology
     }

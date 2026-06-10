@@ -11,18 +11,21 @@ pub struct NodeId(pub u32);
 impl NodeId {
     /// Creates a new node ID.
     #[inline]
+    #[must_use]
     pub const fn new(id: u32) -> Self {
-        NodeId(id)
+        Self(id)
     }
 
     /// Returns the raw ID value.
     #[inline]
+    #[must_use]
     pub const fn as_u32(&self) -> u32 {
         self.0
     }
 
     /// Returns the ID as a usize for indexing.
     #[inline]
+    #[must_use]
     pub const fn as_usize(&self) -> usize {
         self.0 as usize
     }
@@ -30,13 +33,18 @@ impl NodeId {
 
 impl From<u32> for NodeId {
     fn from(id: u32) -> Self {
-        NodeId(id)
+        Self(id)
     }
 }
 
 impl From<usize> for NodeId {
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "NodeId is a 32-bit identifier by definition; simulations never \
+                  approach 2^32 nodes, so a usize node count always fits in u32"
+    )]
     fn from(id: usize) -> Self {
-        NodeId(id as u32)
+        Self(id as u32)
     }
 }
 
@@ -59,12 +67,14 @@ pub struct MessageId(pub u64);
 impl MessageId {
     /// Creates a new message ID.
     #[inline]
+    #[must_use]
     pub const fn new(id: u64) -> Self {
-        MessageId(id)
+        Self(id)
     }
 
     /// Returns the raw ID value.
     #[inline]
+    #[must_use]
     pub const fn as_u64(&self) -> u64 {
         self.0
     }
@@ -72,7 +82,7 @@ impl MessageId {
 
 impl From<u64> for MessageId {
     fn from(id: u64) -> Self {
-        MessageId(id)
+        Self(id)
     }
 }
 
@@ -117,6 +127,6 @@ mod tests {
     fn message_id_basics() {
         let id = MessageId::new(12345);
         assert_eq!(id.as_u64(), 12345);
-        assert_eq!(format!("{}", id), "M12345");
+        assert_eq!(format!("{id}"), "M12345");
     }
 }

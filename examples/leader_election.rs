@@ -13,6 +13,13 @@
 //!
 //! Expected: every node elects the same leader (the one with the highest ID).
 
+// Illustrative example, not load-bearing library code: the demo arithmetic is
+// bounded by the fixed scenario parameters.
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "example code: scenario-bounded arithmetic, not load-bearing"
+)]
+
 use simulacra::{Duration, NodeContext, NodeId, TaskSimBuilder, TopologyBuilder};
 
 const NODE_COUNT: u32 = 5;
@@ -61,7 +68,7 @@ fn main() {
         .full_mesh(Duration::from_millis(2))
         .build();
 
-    let sim = TaskSimBuilder::<u32>::new(topology, 0xA1B2C3).build(elect);
+    let sim = TaskSimBuilder::<u32>::new(topology, 0x00A1_B2C3).build(elect);
     let stats = sim.run();
 
     println!("\n--- Simulation Complete ---");

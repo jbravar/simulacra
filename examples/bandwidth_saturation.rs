@@ -12,6 +12,12 @@
 //! cargo run --example bandwidth_saturation
 //! ```
 
+// Illustrative example, not load-bearing library code.
+#![expect(
+    clippy::cast_possible_truncation,
+    reason = "example code: cast operand is bounded by the fixed scenario"
+)]
+
 use simulacra::{Duration, NetEvent, Network, NodeId, TopologyBuilder};
 
 const LINK_LATENCY: Duration = Duration::from_millis(5);
@@ -50,7 +56,6 @@ fn main() {
         stats.messages_delivered, stats.final_time
     );
     println!(
-        "Without the cap, all {} would have arrived at {} (just the link latency).",
-        MESSAGE_COUNT, LINK_LATENCY
+        "Without the cap, all {MESSAGE_COUNT} would have arrived at {LINK_LATENCY} (just the link latency)."
     );
 }
